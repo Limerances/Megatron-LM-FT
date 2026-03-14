@@ -1,0 +1,1 @@
+python -c "import json; lines = open('raw_data/shakespeare.txt').read().splitlines(); open('raw_data/shakespeare.jsonl', 'w').write('\n'.join([json.dumps({'text': line}) for line in lines if line.strip()]))"
