@@ -26,7 +26,20 @@ export COLLECT_PATH=$COLLECT_BASE_PATH/$TIMESTAMP
 mkdir -p $COLLECT_PATH
 
 
-torchrun --nproc_per_node 1 Megatron-LM-FT/pretrain_gpt.py \
+export TORCH_FR_DUMP_TEMP_FILE=/workspace/nccl_trace
+export TORCH_NCCL_DUMP_ON_TIMEOUT=1
+export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
+
+# export FT_SIM_FAULT_DESC="rank_killed;1;30"
+export FT_SIM_FAULT_DESC="rank_hung;1;30"
+
+
+ft_launcher \
+    --max-restarts 0 \
+    --ft-initial_rank_heartbeat_timeout 50\
+    --ft-rank_heartbeat_timeout 50\
+    \
+    --nproc_per_node 1 Megatron-LM-FT/pretrain_gpt.py \
     --tensor-model-parallel-size 1 \
     --pipeline-model-parallel-size 1 \
     --num-layers 12 \
@@ -57,7 +70,11 @@ torchrun --nproc_per_node 1 Megatron-LM-FT/pretrain_gpt.py \
     --tensorboard-dir $TENSORBOARD \
     --moe-per-layer-logging \
     --moe-aux-loss-coeff 0.01 \
+    --sequence-parallel \
+    --moe-router-dtype fp32 \
     # --save $CHECKPOINT_PATH \
     # --load $CHECKPOINT_PATH \
     # --wandb-project $WANDB_PROJECT \
     # --wandb-exp-name $WANDB_EXP_NAME \
+
+# torchfrtrace --prefix "nccl_trace_" /workspace/nccl_trace
