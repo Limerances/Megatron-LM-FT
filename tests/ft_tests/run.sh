@@ -33,6 +33,7 @@ export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
 # export FT_SIM_FAULT_DESC="rank_killed;1;30"
 export FT_SIM_FAULT_DESC="rank_hung;1;30"
 
+export GROUP_RANK=0
 
 ft_launcher \
     --max-restarts 0 \
