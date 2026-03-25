@@ -108,7 +108,8 @@ def setup() -> None:
     global _NUM_WARMUP_ITERS
     _NUM_WARMUP_ITERS = args.ft_num_warmup_iters
 
-    cli.init_workload_monitoring(num_warmup_iters=_NUM_WARMUP_ITERS)
+    # cli.init_workload_monitoring(num_warmup_iters=_NUM_WARMUP_ITERS)
+    cli.init_workload_monitoring()
     _load_state_if_exists()
     if os.environ.get("RANK") == "0":
         print(f"FT: initialized. Timeouts={cli.section_timeouts}", flush=True)
