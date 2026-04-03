@@ -31,21 +31,25 @@ export TORCH_NCCL_DUMP_ON_TIMEOUT=1
 export TORCH_NCCL_TRACE_BUFFER_SIZE=2000
 
 # export FT_SIM_FAULT_DESC="rank_killed;1;30"
-export FT_SIM_FAULT_DESC="rank_hung;1;30"
+export FT_SIM_FAULT_DESC="rank_hung;1;120"
 
 export GROUP_RANK=0
 
+
+
+    # --ft-initial-rank-heartbeat-timeout 60\
+    # --ft-rank-heartbeat-timeout 80\
+
 ft_launcher \
     --max-restarts 0 \
-    --ft-initial-rank-heartbeat-timeout 50\
-    --ft-rank-heartbeat-timeout 50\
-    \
+    --ft-rank-section-timeout=setup:60,step:30,checkpointing:420 \
+    --ft-rank-out-of-section-timeout 300 \
     --nproc_per_node 4 Megatron-LM-FT/pretrain_gpt.py \
     --enable-ft-package \
     --calc-ft-timeouts \
     --tensor-model-parallel-size 4 \
     --pipeline-model-parallel-size 1 \
-    --num-layers 12 \
+    --num-layers 4 \
     --hidden-size 512 \
     --num-attention-heads 8 \
     --seq-length 1024 \

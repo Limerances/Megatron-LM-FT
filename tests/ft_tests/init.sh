@@ -11,6 +11,10 @@ mkdir nccl_trace
 pip install transformers
 pip install nvidia-resiliency-ext
 
+# pip install --upgrade nvidia-resiliency-ext (0.5.0)
+
+python_debugger 插件
+
 bash preprocess.sh
 
 bash run.sh |& tee log.txt

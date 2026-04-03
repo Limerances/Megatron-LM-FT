@@ -113,6 +113,15 @@ def setup() -> None:
     _load_state_if_exists()
     if os.environ.get("RANK") == "0":
         print(f"FT: initialized. Timeouts={cli.section_timeouts}", flush=True)
+        print("rank_info",cli.rank_info)
+        print("rank_monitor_socket",cli.rank_monitor_socket)
+        print("is_initialized",cli.is_initialized)
+        print("timeouts_calc",cli.timeouts_calc)
+        print("hb_timeouts",cli.hb_timeouts)
+        print("section_timeouts",cli.section_timeouts)
+        print("loaded_hb_timeouts",cli.loaded_hb_timeouts)
+        print("loaded_section_timeouts",cli.loaded_section_timeouts)
+
 
     cli.start_section("setup")
     global _is_setup_section_open
