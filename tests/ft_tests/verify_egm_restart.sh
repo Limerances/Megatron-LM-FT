@@ -13,9 +13,9 @@ cd "${ROOT_DIR}"
 # =========================
 # 你主要改下面这几项即可
 # =========================
-VOCAB_FILE=gpt2_vocab/vocab.json
-MERGE_FILE=gpt2_vocab/merges.txt
-DATA_PATH=data/my_shakespeare_text_document
+VOCAB_FILE=/mnt/workspace/gpt2_vocab/vocab.json
+MERGE_FILE=/mnt/workspace/gpt2_vocab/merges.txt
+DATA_PATH=/mnt/workspace/data/my_shakespeare_text_document
 CHECKPOINT_PATH=/mnt/workspace/egm/checkpoint
 
 # LOG_DIR=/tmp/megatron_egm_verify

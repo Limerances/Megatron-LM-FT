@@ -36,6 +36,30 @@ _EGM_ITERATION_TRACKER = 0
 _ORIGINAL_SIGNAL_HANDLERS = {}
 
 
+def _safe_timer_start(name: str, log_level: int = 1) -> bool:
+    try:
+        timers = get_timers()
+        if timers is None:
+            return False
+        timers(name, log_level=log_level).start(barrier=False)
+        return True
+    except Exception as e:
+        logger.warning(f"EGM: failed to start timer {name}: {e}")
+        return False
+
+
+def _safe_timer_stop_elapsed(name: str) -> Optional[float]:
+    try:
+        timers = get_timers()
+        if timers is None:
+            return None
+        timers(name).stop()
+        return timers(name).elapsed(reset=True)
+    except Exception as e:
+        logger.warning(f"EGM: failed to collect timer {name}: {e}")
+        return None
+
+
 def get_egm_checkpoint_manager():
     return _GLOBAL_EGM_CHECKPOINT_MANAGER
 
@@ -341,18 +365,19 @@ def try_load_from_egm() -> Optional[Dict[str, Any]]:
         f"{restore_source_rank}, loading..."
     )
 
-    timers = get_timers()
-    timers('egm-load', log_level=1).start(barrier=False)
+    timed = _safe_timer_start('egm-load', log_level=1)
 
     state_dict = manager.load_state_dict()
 
-    timers('egm-load').stop()
-    load_time = timers('egm-load').elapsed(reset=True)
+    load_time = _safe_timer_stop_elapsed('egm-load') if timed else None
 
     if state_dict is not None:
-        print_rank_0(
-            f"EGM: loaded checkpoint from EGM in {load_time:.3f} seconds"
-        )
+        if load_time is not None:
+            print_rank_0(
+                f"EGM: loaded checkpoint from EGM in {load_time:.3f} seconds"
+            )
+        else:
+            print_rank_0("EGM: loaded checkpoint from EGM")
     else:
         print_rank_0("EGM: failed to load checkpoint from EGM")
 
@@ -387,10 +412,8 @@ def _save_egm_checkpoint(iteration, model, optimizer, opt_param_scheduler) -> No
         return
 
     args = get_args()
-    timers = get_timers()
-
     print_rank_0(f"EGM: saving checkpoint at iteration {iteration}")
-    timers('egm-save', log_level=1).start(barrier=False)
+    timed = _safe_timer_start('egm-save', log_level=1)
 
     from .checkpointing import generate_state_dict, get_rng_state
     from .utils import unwrap_model
@@ -438,19 +461,24 @@ def _save_egm_checkpoint(iteration, model, optimizer, opt_param_scheduler) -> No
 
     success = manager.save_state_dict(state_dict, iteration)
 
-    timers('egm-save').stop()
-    save_time = timers('egm-save').elapsed(reset=True)
+    save_time = _safe_timer_stop_elapsed('egm-save') if timed else None
 
     if success:
-        print_rank_0(
-            f"EGM: saved checkpoint at iteration {iteration} "
-            f"in {save_time:.3f} seconds"
-        )
+        if save_time is not None:
+            print_rank_0(
+                f"EGM: saved checkpoint at iteration {iteration} "
+                f"in {save_time:.3f} seconds"
+            )
+        else:
+            print_rank_0(f"EGM: saved checkpoint at iteration {iteration}")
     else:
-        print_rank_0(
-            f"EGM: failed to save checkpoint at iteration {iteration} "
-            f"(elapsed {save_time:.3f} seconds)"
-        )
+        if save_time is not None:
+            print_rank_0(
+                f"EGM: failed to save checkpoint at iteration {iteration} "
+                f"(elapsed {save_time:.3f} seconds)"
+            )
+        else:
+            print_rank_0(f"EGM: failed to save checkpoint at iteration {iteration}")
 
     if success and getattr(args, 'egm_hierarchical_backup', False):
         _trigger_hierarchical_backup(manager)
@@ -463,21 +491,21 @@ def _trigger_hierarchical_backup(manager) -> None:
     )
 
     args = get_args()
-    timers = get_timers()
-
     print_rank_0("EGM: triggering hierarchical backup")
-    timers('egm-backup', log_level=1).start(barrier=False)
+    timed = _safe_timer_start('egm-backup', log_level=1)
 
     best_slot = manager._find_best_valid_slot()
     if best_slot is None:
         print_rank_0("EGM: no valid slot for hierarchical backup")
-        timers('egm-backup').stop()
+        if timed:
+            _safe_timer_stop_elapsed('egm-backup')
         return
 
     raw_data = manager.get_raw_slot_data(best_slot)
     if raw_data is None:
         print_rank_0("EGM: failed to read slot data for backup")
-        timers('egm-backup').stop()
+        if timed:
+            _safe_timer_stop_elapsed('egm-backup')
         return
 
     intra_success = intra_rack_ring_backup(manager, raw_data)
@@ -486,10 +514,15 @@ def _trigger_hierarchical_backup(manager) -> None:
     if getattr(args, 'egm_backup_rack_id', -1) >= 0:
         inter_success = inter_rack_pair_backup(manager, raw_data)
 
-    timers('egm-backup').stop()
-    backup_time = timers('egm-backup').elapsed(reset=True)
+    backup_time = _safe_timer_stop_elapsed('egm-backup') if timed else None
 
-    print_rank_0(
-        f"EGM: hierarchical backup completed in {backup_time:.3f} seconds "
-        f"(intra_rack={intra_success}, inter_rack={inter_success})"
-    )
+    if backup_time is not None:
+        print_rank_0(
+            f"EGM: hierarchical backup completed in {backup_time:.3f} seconds "
+            f"(intra_rack={intra_success}, inter_rack={inter_success})"
+        )
+    else:
+        print_rank_0(
+            f"EGM: hierarchical backup completed "
+            f"(intra_rack={intra_success}, inter_rack={inter_success})"
+        )
