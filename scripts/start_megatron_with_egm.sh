@@ -14,6 +14,7 @@ EGM_NUMA_NODE_ID="${EGM_NUMA_NODE_ID:-0}"
 EGM_DEVICE_ID="${EGM_DEVICE_ID:-0}"
 EGM_SOCKET_PATH="${EGM_SOCKET_PATH:-/tmp/megatron_egm_manager.sock}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+EGM_DAEMON_READY_TIMEOUT_S="${EGM_DAEMON_READY_TIMEOUT_S:-60}"
 
 TOTAL_DAEMON_SLOTS="${EGM_DAEMON_NUM_SLOTS:-$((NPROC_PER_NODE * EGM_NUM_SLOTS))}"
 
@@ -58,7 +59,13 @@ trap cleanup EXIT INT TERM
 ) &
 EGM_DAEMON_PID=$!
 
-for _ in $(seq 1 50); do
+deadline=$((SECONDS + EGM_DAEMON_READY_TIMEOUT_S))
+while [[ ${SECONDS} -lt ${deadline} ]]; do
+    if ! kill -0 "${EGM_DAEMON_PID}" 2>/dev/null; then
+        echo "EGM daemon exited before becoming ready" >&2
+        wait "${EGM_DAEMON_PID}" || true
+        exit 1
+    fi
     if [[ -S "${EGM_SOCKET_PATH}" ]] && (
         cd "${ROOT_DIR}" &&
         python3 - <<'PY' "${EGM_SOCKET_PATH}" >/dev/null 2>&1
@@ -75,11 +82,11 @@ PY
     ); then
         break
     fi
-    sleep 0.2
+    sleep 0.5
 done
 
 if [[ ! -S "${EGM_SOCKET_PATH}" ]]; then
-    echo "EGM daemon did not create socket: ${EGM_SOCKET_PATH}" >&2
+    echo "EGM daemon did not create socket within ${EGM_DAEMON_READY_TIMEOUT_S}s: ${EGM_SOCKET_PATH}" >&2
     exit 1
 fi
 

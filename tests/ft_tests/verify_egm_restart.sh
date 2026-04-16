@@ -17,16 +17,18 @@ VOCAB_FILE=gpt2_vocab/vocab.json
 MERGE_FILE=gpt2_vocab/merges.txt
 DATA_PATH=data/my_shakespeare_text_document
 
-LOG_DIR=/tmp/megatron_egm_verify
+# LOG_DIR=/tmp/megatron_egm_verify
+LOG_DIR=/mnt/workspace/egm
 LOG_FILE="${LOG_DIR}/verify_egm_restart.log"
 
 NPROC_PER_NODE=4
-TRAIN_ITERS=80
-EGM_SAVE_INTERVAL=10
-EGM_POOL_SIZE_GB=4
+TRAIN_ITERS=1000
+EGM_SAVE_INTERVAL=20
+EGM_POOL_SIZE_GB=32
 EGM_NUM_SLOTS=2
 EGM_NUMA_NODE_ID=0
-EGM_SOCKET_PATH=/tmp/megatron_egm_manager.sock
+# EGM_SOCKET_PATH=/tmp/megatron_egm_manager.sock
+EGM_SOCKET_PATH=/mnt/workspace/egm/megatron_egm_manager.sock
 
 # Simulate one hung rank so ft_launcher kills and restarts the job.
 FT_SIM_FAULT_DESC="rank_hung;1;120"
