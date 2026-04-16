@@ -1572,6 +1572,94 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     args = get_args()
     load_dir = getattr(args, load_arg)
 
+    if getattr(args, 'enable_egm_checkpoint', False) and not getattr(args, 'finetune', False):
+        from megatron.training import egm_integration
+        egm_state = egm_integration.try_load_from_egm()
+        if egm_state is not None:
+            _model = unwrap_model(ddp_model)
+            if not isinstance(_model, list):
+                _model = [_model]
+
+            if not skip_load_to_model_and_opt:
+                for i, model_module in enumerate(_model):
+                    key = "model" if len(_model) == 1 else f"model{i}"
+                    if key in egm_state:
+                        model_module.load_state_dict(egm_state[key], strict=strict)
+
+            if (
+                not skip_load_to_model_and_opt
+                and optimizer is not None
+                and 'optimizer' in egm_state
+                and not args.no_load_optim
+            ):
+                optimizer.load_state_dict(egm_state['optimizer'])
+
+            if (
+                opt_param_scheduler is not None
+                and 'opt_param_scheduler' in egm_state
+                and not args.no_load_optim
+            ):
+                opt_param_scheduler.load_state_dict(egm_state['opt_param_scheduler'])
+
+            if not args.no_load_rng and 'rng_state' in egm_state:
+                try:
+                    import random
+                    import numpy as np
+                    rng_state_list = egm_state['rng_state']
+                    if isinstance(rng_state_list, list):
+                        # get_rng_state("torch") collects states across DP ranks
+                        # via all_gather_object on the DP group, so the list is
+                        # indexed by DP rank (not TP rank).
+                        dp_rank = mpu.get_data_parallel_rank(with_context_parallel=True)
+                        if dp_rank < len(rng_state_list):
+                            rng_state_entry = rng_state_list[dp_rank]
+                        else:
+                            # Fallback: single-element list from non-DP-init save
+                            rng_state_entry = rng_state_list[0]
+                    else:
+                        rng_state_entry = rng_state_list
+                    if isinstance(rng_state_entry, dict):
+                        random.setstate(rng_state_entry['random_rng_state'])
+                        np.random.set_state(rng_state_entry['np_rng_state'])
+                        torch.set_rng_state(rng_state_entry['torch_rng_state'])
+                        torch.cuda.set_rng_state(rng_state_entry['cuda_rng_state'])
+                        if 'rng_tracker_states' in rng_state_entry:
+                            tensor_parallel.get_cuda_rng_tracker().set_states(
+                                rng_state_entry['rng_tracker_states']
+                            )
+                except Exception as rng_err:
+                    print_rank_0(f'Warning: failed to restore RNG state from EGM: {rng_err}')
+
+            # Restore rerun state machine
+            if 'rerun_state_machine' in egm_state:
+                try:
+                    rerun_state_machine = get_rerun_state_machine()
+                    if rerun_state_machine.validate_state_dict(
+                        egm_state['rerun_state_machine']
+                    ):
+                        rerun_state_machine.load_state_dict(
+                            egm_state['rerun_state_machine']
+                        )
+                        print_rank_0('EGM: restored rerun_state_machine')
+                    else:
+                        print_rank_0(
+                            'EGM: rerun_state_machine validation failed, skipping'
+                        )
+                except Exception as rerun_err:
+                    print_rank_0(
+                        f'Warning: failed to restore rerun state from EGM: {rerun_err}'
+                    )
+
+            egm_iter = egm_state.get('iteration', 0)
+            egm_flops = egm_state.get('num_floating_point_operations_so_far', 0)
+
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+
+            print_rank_0(f'Loaded checkpoint from EGM at iteration {egm_iter}')
+            ft_integration.on_checkpoint_loaded(True)
+            return egm_iter, egm_flops
+
     # Finetuning directories
     pretrained_dir = getattr(args, 'pretrained_checkpoint', None)
     if pretrained_dir is not None and not checkpoint_exists(load_dir):

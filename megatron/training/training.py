@@ -200,6 +200,7 @@ from . import one_logger_utils
 from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgrads
 
 from . import ft_integration
+from . import egm_integration
 
 stimer = StragglerDetector()
 
@@ -886,6 +887,8 @@ def pretrain(
     # Track E2E metrics on pretrain start
     one_logger_utils.on_pretrain_start()
 
+    egm_integration.setup(args)
+
     # Context used for persisting some state between checkpoint saves.
     if args.non_persistent_ckpt_type == 'local':
         try:
@@ -1171,6 +1174,7 @@ def pretrain(
     if args.perform_rl_step:
         rl_utils.rl_inference_interface_shutdown()
 
+    egm_integration.shutdown()
     ft_integration.shutdown()
     one_logger_utils.finish()
 
@@ -2914,19 +2918,35 @@ def train(
             max_attention_logit = None
         else:
             ft_integration.on_training_step_start()
-            (
-                loss_dict,
-                skipped_iter,
-                should_checkpoint,
-                should_exit,
-                exit_code,
-                grad_norm,
-                num_zeros_in_grad,
-                max_attention_logit,
-            ) = train_step(
-                forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
-            )
+            try:
+                (
+                    loss_dict,
+                    skipped_iter,
+                    should_checkpoint,
+                    should_exit,
+                    exit_code,
+                    grad_norm,
+                    num_zeros_in_grad,
+                    max_attention_logit,
+                ) = train_step(
+                    forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
+                )
+            except Exception as train_exc:
+                # Catch training step exceptions (NCCL timeout, CUDA error, etc.)
+                # to trigger EGM fault recovery before the process exits
+                egm_integration.on_fault_detected(
+                    iteration=iteration,
+                    model=model,
+                    optimizer=optimizer,
+                    opt_param_scheduler=opt_param_scheduler,
+                    fault_type=egm_integration.classify_fault_type(train_exc),
+                    fault_rank=torch.distributed.get_rank() if torch.distributed.is_initialized() else 0,
+                )
+                raise train_exc
             ft_integration.on_training_step_end()
+            egm_integration.on_training_step_end(
+                iteration, model, optimizer, opt_param_scheduler
+            )
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -3160,6 +3180,7 @@ def train(
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
+        egm_integration.shutdown()
         ft_integration.shutdown()
         one_logger_utils.finish()
         if args.perform_rl_step:

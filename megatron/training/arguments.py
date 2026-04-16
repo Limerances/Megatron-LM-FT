@@ -78,6 +78,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_one_logger_args(parser)
     parser = _add_inprocess_restart_args(parser)
     parser = _add_ft_package_args(parser)
+    parser = _add_egm_checkpoint_args(parser)
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
@@ -2129,6 +2130,41 @@ def _add_ft_package_args(parser):
                        'out-of-section timeouts. The first N iterations are excluded from '
                        'timeout monitoring as they can be significantly slower than steady-state. '
                        'Default: 5. Note: This feature is for Nvidia internal use only.')
+    return parser
+
+
+def _add_egm_checkpoint_args(parser):
+    group = parser.add_argument_group(title='egm_checkpoint')
+    group.add_argument('--enable-egm-checkpoint', action='store_true',
+                       help='Enable EGM (Extended GPU Memory) in-memory checkpointing '
+                       'for fast fault recovery on NVL72 architecture.')
+    group.add_argument('--egm-pool-size-gb', type=float, default=16.0,
+                       help='Size of the EGM memory pool per GPU in GB.')
+    group.add_argument('--egm-num-slots', type=int, default=2,
+                       help='Number of checkpoint slots for double-buffering.')
+    group.add_argument('--egm-save-interval', type=int, default=10,
+                       help='Save EGM checkpoint every N training iterations.')
+    group.add_argument('--egm-hierarchical-backup', action='store_true',
+                       help='Enable hierarchical backup: intra-rack ring backup via '
+                       'NVLink + inter-rack pair backup.')
+    group.add_argument('--egm-rack-id', type=int, default=0,
+                       help='Physical rack identifier for this node.')
+    group.add_argument('--egm-backup-rack-id', type=int, default=-1,
+                       help='Paired rack identifier for cross-rack backup. '
+                       '-1 means no cross-rack backup.')
+    group.add_argument('--egm-use-daemon', action='store_true',
+                       help='Use an external EGM daemon process to hold EGM memory, '
+                       'ensuring checkpoint data survives training process crashes.')
+    group.add_argument('--egm-daemon-socket-path', type=str,
+                       default='/tmp/megatron_egm_manager.sock',
+                       help='Unix domain socket path for connecting to the EGM daemon.')
+    group.add_argument('--egm-numa-node-id', type=int, default=0,
+                       help='NUMA node ID for EGM memory allocation '
+                       '(Grace CPU LPDDR5X on GB200).')
+    group.add_argument('--egm-fault-max-failures', type=int, default=3,
+                       help='Maximum failures per node before exclusion.')
+    group.add_argument('--egm-fault-exclusion-window', type=int, default=3600,
+                       help='Time window in seconds for counting node failures.')
     return parser
 
 
