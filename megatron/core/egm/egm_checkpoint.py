@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import copy
 import struct
 import threading
 import time
@@ -99,6 +100,7 @@ class EGMCheckpointManager:
         self._current_write_slot: int = 0
         self._slot_capacity_bytes: int = 0
         self._explicit_restore_source_rank: Optional[int] = None
+        self._last_save_stats: Optional[Dict[str, Any]] = None
         self._lock = threading.Lock()
         self._initialized = False
 
@@ -189,7 +191,9 @@ class EGMCheckpointManager:
 
         with self._lock:
             try:
+                serialize_start = time.perf_counter()
                 data = self._serialize_to_buffer(state_dict)
+                serialize_end = time.perf_counter()
                 if len(data) + _HEADER_SIZE > self._slot_capacity_bytes:
                     logger.error(
                         f"Data size ({len(data) + _HEADER_SIZE}) exceeds "
@@ -200,21 +204,42 @@ class EGMCheckpointManager:
                 checksum = _compute_checksum(data)
                 header = _build_header(iteration, len(data), checksum, self.rank)
                 raw_bytes = header + data
+                write_start = time.perf_counter()
                 slot = self._write_raw_slot_data_internal(
                     self._current_write_slot, raw_bytes, iteration
                 )
+                write_end = time.perf_counter()
                 if slot is None:
                     return False
 
+                backend_slot = self._backend_slot_ids[slot]
+                self._last_save_stats = {
+                    "rank": self.rank,
+                    "local_rank": self.local_rank,
+                    "iteration": iteration,
+                    "local_slot": slot,
+                    "backend_slot": backend_slot,
+                    "payload_bytes": len(data),
+                    "total_bytes": len(raw_bytes),
+                    "serialize_seconds": serialize_end - serialize_start,
+                    "write_seconds": write_end - write_start,
+                    "total_seconds": write_end - serialize_start,
+                }
                 logger.info(
-                    f"[MCORE][EGM] Saved checkpoint to slot {slot}: "
-                    f"iteration={iteration}, data_size={len(data)}"
+                    f"[MCORE][EGM] Saved checkpoint to local_slot={slot} "
+                    f"backend_slot={backend_slot}: iteration={iteration}, "
+                    f"data_size={len(data)}"
                 )
                 return True
 
             except Exception as e:
                 logger.error(f"[MCORE][EGM] save_state_dict failed: {e}")
                 return False
+
+    def get_last_save_stats(self) -> Optional[Dict[str, Any]]:
+        if self._last_save_stats is None:
+            return None
+        return copy.deepcopy(self._last_save_stats)
 
     def load_state_dict(self) -> Optional[Dict[str, Any]]:
         if not self._initialized:

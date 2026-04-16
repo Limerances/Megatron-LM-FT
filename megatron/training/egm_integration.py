@@ -17,6 +17,7 @@ recovery coordination.
 import os
 import signal
 import sys
+import time
 from logging import getLogger
 from typing import Any, Dict, Optional, Set
 
@@ -34,6 +35,19 @@ _GLOBAL_RECOVERY_COORDINATOR = None
 _ORIGINAL_EXCEPTHOOK = None
 _EGM_ITERATION_TRACKER = 0
 _ORIGINAL_SIGNAL_HANDLERS = {}
+_EGM_TIMER_WARNING_KEYS = set()
+
+
+def _log_timer_issue_once(action: str, name: str, error: Exception) -> None:
+    message = str(error)
+    if "dummy timer should not be used" in message:
+        return
+
+    key = (action, name, message)
+    if key in _EGM_TIMER_WARNING_KEYS:
+        return
+    _EGM_TIMER_WARNING_KEYS.add(key)
+    logger.warning(f"EGM: failed to {action} timer {name}: {error}")
 
 
 def _safe_timer_start(name: str, log_level: int = 1) -> bool:
@@ -44,7 +58,7 @@ def _safe_timer_start(name: str, log_level: int = 1) -> bool:
         timers(name, log_level=log_level).start(barrier=False)
         return True
     except Exception as e:
-        logger.warning(f"EGM: failed to start timer {name}: {e}")
+        _log_timer_issue_once("start", name, e)
         return False
 
 
@@ -56,7 +70,7 @@ def _safe_timer_stop_elapsed(name: str) -> Optional[float]:
         timers(name).stop()
         return timers(name).elapsed(reset=True)
     except Exception as e:
-        logger.warning(f"EGM: failed to collect timer {name}: {e}")
+        _log_timer_issue_once("collect", name, e)
         return None
 
 
@@ -412,6 +426,12 @@ def _save_egm_checkpoint(iteration, model, optimizer, opt_param_scheduler) -> No
         return
 
     args = get_args()
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    local_rank = (
+        int(os.environ.get("LOCAL_RANK", rank))
+        if torch.distributed.is_initialized() or torch.cuda.is_available()
+        else 0
+    )
     print_rank_0(f"EGM: saving checkpoint at iteration {iteration}")
     timed = _safe_timer_start('egm-save', log_level=1)
 
@@ -459,18 +479,53 @@ def _save_egm_checkpoint(iteration, model, optimizer, opt_param_scheduler) -> No
         args, 'num_floating_point_operations_so_far', 0
     )
 
+    wall_start = time.perf_counter()
     success = manager.save_state_dict(state_dict, iteration)
+    wall_end = time.perf_counter()
 
     save_time = _safe_timer_stop_elapsed('egm-save') if timed else None
+    save_stats = manager.get_last_save_stats() if success else None
 
     if success:
-        if save_time is not None:
-            print_rank_0(
-                f"EGM: saved checkpoint at iteration {iteration} "
-                f"in {save_time:.3f} seconds"
+        if save_stats is not None:
+            payload_bytes = float(save_stats["payload_bytes"])
+            total_bytes = float(save_stats["total_bytes"])
+            serialize_s = float(save_stats["serialize_seconds"])
+            write_s = float(save_stats["write_seconds"])
+            total_s = float(save_stats["total_seconds"])
+            wall_s = wall_end - wall_start
+            payload_gib = payload_bytes / (1024 ** 3)
+            total_gib = total_bytes / (1024 ** 3)
+            write_bw_gib_s = (
+                total_gib / write_s if write_s > 0 else 0.0
+            )
+            end_to_end_bw_gib_s = (
+                total_gib / total_s if total_s > 0 else 0.0
+            )
+            print(
+                "EGM_SAVE_STATS "
+                f"rank={rank} local_rank={local_rank} iteration={iteration} "
+                f"local_slot={save_stats['local_slot']} "
+                f"backend_slot={save_stats['backend_slot']} "
+                f"payload_gib={payload_gib:.3f} total_gib={total_gib:.3f} "
+                f"serialize_s={serialize_s:.3f} write_s={write_s:.3f} "
+                f"manager_total_s={total_s:.3f} wall_s={wall_s:.3f} "
+                f"write_bw_gib_s={write_bw_gib_s:.3f} "
+                f"end_to_end_bw_gib_s={end_to_end_bw_gib_s:.3f}",
+                flush=True,
+            )
+        elif save_time is not None:
+            print(
+                f"EGM_SAVE_STATS rank={rank} local_rank={local_rank} "
+                f"iteration={iteration} total_s={save_time:.3f}",
+                flush=True,
             )
         else:
-            print_rank_0(f"EGM: saved checkpoint at iteration {iteration}")
+            print(
+                f"EGM_SAVE_STATS rank={rank} local_rank={local_rank} "
+                f"iteration={iteration} status=ok",
+                flush=True,
+            )
     else:
         if save_time is not None:
             print_rank_0(
