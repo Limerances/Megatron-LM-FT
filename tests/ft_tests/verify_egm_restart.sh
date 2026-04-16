@@ -16,9 +16,10 @@ cd "${ROOT_DIR}"
 VOCAB_FILE=gpt2_vocab/vocab.json
 MERGE_FILE=gpt2_vocab/merges.txt
 DATA_PATH=data/my_shakespeare_text_document
+CHECKPOINT_PATH=/mnt/workspace/egm/checkpoint
 
 # LOG_DIR=/tmp/megatron_egm_verify
-LOG_DIR=/mnt/workspace/egm
+LOG_DIR=/mnt/workspace/egm/log
 LOG_FILE="${LOG_DIR}/verify_egm_restart.log"
 
 NPROC_PER_NODE=4
@@ -34,6 +35,7 @@ EGM_SOCKET_PATH=/mnt/workspace/egm/megatron_egm_manager.sock
 FT_SIM_FAULT_DESC="rank_hung;1;120"
 
 mkdir -p "${LOG_DIR}"
+mkdir -p "${CHECKPOINT_PATH}"
 
 export NPROC_PER_NODE
 export EGM_POOL_SIZE_GB
@@ -87,6 +89,7 @@ bash "${ROOT_DIR}/scripts/start_megatron_with_egm.sh" \
     --moe-aux-loss-coeff 0.01 \
     --sequence-parallel \
     --moe-router-dtype fp32 \
+    --save "${CHECKPOINT_PATH}" \
     --enable-egm-checkpoint \
     --egm-use-daemon \
     --egm-pool-size-gb "${EGM_POOL_SIZE_GB}" \
