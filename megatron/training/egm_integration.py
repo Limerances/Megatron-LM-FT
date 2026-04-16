@@ -503,27 +503,33 @@ def _save_egm_checkpoint(iteration, model, optimizer, opt_param_scheduler) -> No
                 total_gib / total_s if total_s > 0 else 0.0
             )
             print(
-                "EGM_SAVE_STATS "
-                f"rank={rank} local_rank={local_rank} iteration={iteration} "
-                f"local_slot={save_stats['local_slot']} "
-                f"backend_slot={save_stats['backend_slot']} "
-                f"payload_gib={payload_gib:.3f} total_gib={total_gib:.3f} "
-                f"serialize_s={serialize_s:.3f} write_s={write_s:.3f} "
-                f"manager_total_s={total_s:.3f} wall_s={wall_s:.3f} "
-                f"write_bw_gib_s={write_bw_gib_s:.3f} "
-                f"end_to_end_bw_gib_s={end_to_end_bw_gib_s:.3f}",
+                "EGM_SAVE_STATS"
+                f" | rank={rank} (local_rank={local_rank})"
+                f" | iter={iteration}"
+                f" | slot=local:{save_stats['local_slot']}/backend:{save_stats['backend_slot']}"
+                f" | size={payload_gib:.3f} GiB"
+                f" | serialize={serialize_s:.3f} s"
+                f" | write={write_s:.3f} s"
+                f" | total={total_s:.3f} s"
+                f" | wall={wall_s:.3f} s"
+                f" | write_bw={write_bw_gib_s:.3f} GiB/s"
+                f" | end_to_end_bw={end_to_end_bw_gib_s:.3f} GiB/s",
                 flush=True,
             )
         elif save_time is not None:
             print(
-                f"EGM_SAVE_STATS rank={rank} local_rank={local_rank} "
-                f"iteration={iteration} total_s={save_time:.3f}",
+                "EGM_SAVE_STATS"
+                f" | rank={rank} (local_rank={local_rank})"
+                f" | iter={iteration}"
+                f" | total={save_time:.3f} s",
                 flush=True,
             )
         else:
             print(
-                f"EGM_SAVE_STATS rank={rank} local_rank={local_rank} "
-                f"iteration={iteration} status=ok",
+                "EGM_SAVE_STATS"
+                f" | rank={rank} (local_rank={local_rank})"
+                f" | iter={iteration}"
+                " | status=ok",
                 flush=True,
             )
     else:
