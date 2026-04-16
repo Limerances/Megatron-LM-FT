@@ -476,6 +476,7 @@ class EGMCheckpointManager:
 
         try:
             from megatron.core.egm.egm_manager import (
+                _coerce_cuda_ptr,
                 _normalize_cuda_error_code,
                 _set_host_device_rw_access,
             )
@@ -492,6 +493,7 @@ class EGMCheckpointManager:
             err, va_addr = cuda_driver.cuMemAddressReserve(size_bytes, 0, 0, 0)
             if _normalize_cuda_error_code(err) != cuda_driver.CUresult.CUDA_SUCCESS:
                 raise RuntimeError(f"cuMemAddressReserve failed: {err}")
+            va_addr = _coerce_cuda_ptr(va_addr)
 
             err = cuda_driver.cuMemMap(va_addr, size_bytes, 0, imported_handle, 0)
             if _normalize_cuda_error_code(err) != cuda_driver.CUresult.CUDA_SUCCESS:

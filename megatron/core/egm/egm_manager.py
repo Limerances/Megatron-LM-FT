@@ -88,6 +88,15 @@ def _normalize_cuda_error_code(err: Any) -> Any:
     return err
 
 
+def _coerce_cuda_ptr(value: Any) -> int:
+    if isinstance(value, int):
+        return value
+    raw = getattr(value, "value", None)
+    if isinstance(raw, int):
+        return raw
+    return int(value)
+
+
 def _check_cuda_error(err, msg="CUDA driver API call failed"):
     if _cuda_driver_available:
         normalized = _normalize_cuda_error_code(err)
@@ -369,6 +378,7 @@ class EGMManager:
 
         err, va_addr = cuda_driver.cuMemAddressReserve(aligned_size, 0, 0, 0)
         _check_cuda_error(err, "cuMemAddressReserve failed")
+        va_addr = _coerce_cuda_ptr(va_addr)
         self._va_ranges.append((va_addr, aligned_size))
 
         err = cuda_driver.cuMemMap(va_addr, aligned_size, 0, mem_handle, 0)
