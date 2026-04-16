@@ -90,6 +90,7 @@ bash "${ROOT_DIR}/scripts/start_megatron_with_egm.sh" \
     --sequence-parallel \
     --moe-router-dtype fp32 \
     --save "${CHECKPOINT_PATH}" \
+    --load "${CHECKPOINT_PATH}" \
     --enable-egm-checkpoint \
     --egm-use-daemon \
     --egm-pool-size-gb "${EGM_POOL_SIZE_GB}" \
