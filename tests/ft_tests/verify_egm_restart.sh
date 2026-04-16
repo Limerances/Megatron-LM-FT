@@ -47,7 +47,7 @@ echo "FT_SIM_FAULT_DESC=${FT_SIM_FAULT_DESC}"
 echo "EGM_SOCKET_PATH=${EGM_SOCKET_PATH}"
 
 set +e
-"${ROOT_DIR}/scripts/start_megatron_with_egm.sh" \
+bash "${ROOT_DIR}/scripts/start_megatron_with_egm.sh" \
     ft_launcher \
     --max-restarts 1 \
     --ft-rank-section-timeout=setup:60,step:30,checkpointing:420 \

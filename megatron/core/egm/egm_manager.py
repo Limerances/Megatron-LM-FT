@@ -77,9 +77,21 @@ def _serialize_shareable_handle(shareable_handle: Any) -> Optional[str]:
     return base64.b64encode(raw).decode("ascii")
 
 
+def _normalize_cuda_error_code(err: Any) -> Any:
+    # cuda.bindings.driver and cuda.cuda do not always return the CUresult
+    # in the same shape. For example, cuInit() may return CUDA_SUCCESS or
+    # a single-element tuple like (CUDA_SUCCESS,).
+    if isinstance(err, tuple):
+        if len(err) == 0:
+            return None
+        return err[0]
+    return err
+
+
 def _check_cuda_error(err, msg="CUDA driver API call failed"):
     if _cuda_driver_available:
-        if err != cuda_driver.CUresult.CUDA_SUCCESS:
+        normalized = _normalize_cuda_error_code(err)
+        if normalized != cuda_driver.CUresult.CUDA_SUCCESS:
             raise EGMError(f"{msg}: {err}")
 
 

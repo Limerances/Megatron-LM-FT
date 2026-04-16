@@ -475,23 +475,26 @@ class EGMCheckpointManager:
             return
 
         try:
-            from megatron.core.egm.egm_manager import _set_host_device_rw_access
+            from megatron.core.egm.egm_manager import (
+                _normalize_cuda_error_code,
+                _set_host_device_rw_access,
+            )
 
             raw_handle = base64.b64decode(handle_b64)
             err, imported_handle = cuda_driver.cuMemImportFromShareableHandle(
                 raw_handle,
                 cuda_driver.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
             )
-            if err != cuda_driver.CUresult.CUDA_SUCCESS:
+            if _normalize_cuda_error_code(err) != cuda_driver.CUresult.CUDA_SUCCESS:
                 raise RuntimeError(f"cuMemImportFromShareableHandle failed: {err}")
 
             size_bytes = int(slot_info.get("size_bytes", self._slot_capacity_bytes))
             err, va_addr = cuda_driver.cuMemAddressReserve(size_bytes, 0, 0, 0)
-            if err != cuda_driver.CUresult.CUDA_SUCCESS:
+            if _normalize_cuda_error_code(err) != cuda_driver.CUresult.CUDA_SUCCESS:
                 raise RuntimeError(f"cuMemAddressReserve failed: {err}")
 
             err = cuda_driver.cuMemMap(va_addr, size_bytes, 0, imported_handle, 0)
-            if err != cuda_driver.CUresult.CUDA_SUCCESS:
+            if _normalize_cuda_error_code(err) != cuda_driver.CUresult.CUDA_SUCCESS:
                 raise RuntimeError(f"cuMemMap failed: {err}")
 
             _set_host_device_rw_access(
