@@ -382,10 +382,56 @@ def try_load_from_egm() -> Optional[Dict[str, Any]]:
     timed = _safe_timer_start('egm-load', log_level=1)
 
     state_dict = manager.load_state_dict()
+    load_stats = manager.get_last_load_stats() if state_dict is not None else None
 
     load_time = _safe_timer_stop_elapsed('egm-load') if timed else None
 
     if state_dict is not None:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        local_rank = (
+            int(os.environ.get("LOCAL_RANK", rank))
+            if torch.distributed.is_initialized() or torch.cuda.is_available()
+            else 0
+        )
+        if load_stats is not None:
+            payload_bytes = float(load_stats.get("payload_bytes", 0))
+            total_bytes = float(load_stats.get("total_bytes", 0))
+            metadata_bytes = float(load_stats.get("metadata_bytes", 0))
+            tensor_bytes = float(load_stats.get("tensor_bytes", 0))
+            load_s = float(load_stats.get("load_seconds", 0.0))
+            header_read_s = float(load_stats.get("header_read_seconds", 0.0))
+            metadata_read_s = float(load_stats.get("metadata_read_seconds", 0.0))
+            tensor_read_s = float(load_stats.get("tensor_read_seconds", 0.0))
+            cpu_copy_bw = float(load_stats.get("cpu_copy_bw_gib_s", 0.0)) if load_stats.get("cpu_copy_bw_gib_s") is not None else 0.0
+            gpu_copy_bw = float(load_stats.get("gpu_copy_bw_gib_s", 0.0)) if load_stats.get("gpu_copy_bw_gib_s") is not None else 0.0
+            direct_read_s = float(load_stats.get("direct_read_seconds", 0.0)) if load_stats.get("direct_read_seconds") is not None else 0.0
+            direct_read_bw = float(load_stats.get("direct_read_bw_gib_s", 0.0)) if load_stats.get("direct_read_bw_gib_s") is not None else 0.0
+            direct_read_path = load_stats.get("direct_read_path")
+            load_format = load_stats.get("load_format")
+            tensor_count = load_stats.get("tensor_count")
+            print(
+                "EGM_LOAD_STATS"
+                f" | rank={rank} (local_rank={local_rank})"
+                f" | iter={load_stats.get('iteration')}"
+                f" | slot=local:{load_stats.get('local_slot')}/backend:{load_stats.get('backend_slot')}"
+                f" | size={(payload_bytes / (1024 ** 3)):.3f} GiB"
+                f" | total_size={(total_bytes / (1024 ** 3)):.3f} GiB"
+                f" | metadata={(metadata_bytes / (1024 ** 3)):.6f} GiB"
+                f" | tensor_bytes={(tensor_bytes / (1024 ** 3)):.3f} GiB"
+                f" | tensor_count={tensor_count}"
+                f" | load={load_s:.3f} s"
+                f" | header_read={header_read_s:.6f} s"
+                f" | metadata_read={metadata_read_s:.6f} s"
+                f" | tensor_read={tensor_read_s:.6f} s"
+                f" | load_bw={(float(total_bytes) / (1024 ** 3) / load_s) if load_s > 0 else 0.0:.3f} GiB/s"
+                f" | format={load_format}"
+                f" | cpu_copy_bw={cpu_copy_bw:.3f} GiB/s"
+                f" | gpu_copy_bw={gpu_copy_bw:.3f} GiB/s"
+                f" | direct_read={direct_read_s:.6f} s"
+                f" | direct_read_bw={direct_read_bw:.3f} GiB/s"
+                f" | direct_path={direct_read_path}",
+                flush=True,
+            )
         if load_time is not None:
             print_rank_0(
                 f"EGM: loaded checkpoint from EGM in {load_time:.3f} seconds"

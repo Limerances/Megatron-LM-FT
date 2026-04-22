@@ -117,6 +117,7 @@ class EGMCheckpointManager:
         self._slot_capacity_bytes: int = 0
         self._explicit_restore_source_rank: Optional[int] = None
         self._last_save_stats: Optional[Dict[str, Any]] = None
+        self._last_load_stats: Optional[Dict[str, Any]] = None
         self._lock = threading.Lock()
         self._initialized = False
 
@@ -244,6 +245,11 @@ class EGMCheckpointManager:
             return None
         return copy.deepcopy(self._last_save_stats)
 
+    def get_last_load_stats(self) -> Optional[Dict[str, Any]]:
+        if self._last_load_stats is None:
+            return None
+        return copy.deepcopy(self._last_load_stats)
+
     def load_state_dict(self) -> Optional[Dict[str, Any]]:
         if not self._initialized:
             return None
@@ -262,26 +268,68 @@ class EGMCheckpointManager:
                 return None
 
             try:
-                raw_data = self._read_raw_slot_data_internal(best_slot)
-                if raw_data is None or len(raw_data) < _HEADER_SIZE:
+                load_start = time.perf_counter()
+                header_bytes = self._read_slot_byte_range(best_slot, 0, _HEADER_SIZE)
+                if header_bytes is None or len(header_bytes) < _HEADER_SIZE:
                     return None
 
-                header_bytes = raw_data[:_HEADER_SIZE]
                 magic, version, iteration, data_size, reserved, trailer = _parse_header(header_bytes)
 
                 if magic != _HEADER_MAGIC:
                     logger.error(f"[MCORE][EGM] Invalid magic: 0x{magic:x}")
                     return None
 
-                payload = raw_data[_HEADER_SIZE:_HEADER_SIZE + data_size]
                 if version == _HEADER_VERSION_STRUCTURED:
-                    state_dict = self._deserialize_structured_payload(payload, trailer)
+                    state_dict, load_stats = self._deserialize_structured_slot(
+                        best_slot, trailer
+                    )
                 else:
+                    raw_data = self._read_raw_slot_data_internal(best_slot)
+                    if raw_data is None or len(raw_data) < _HEADER_SIZE:
+                        return None
+                    payload = raw_data[_HEADER_SIZE:_HEADER_SIZE + data_size]
                     actual_checksum = _compute_checksum(payload)
                     if actual_checksum != trailer:
                         logger.error("[MCORE][EGM] Checksum mismatch")
                         return None
                     state_dict = self._deserialize_from_buffer(payload)
+                    load_stats = {
+                        "payload_bytes": data_size,
+                        "total_bytes": _HEADER_SIZE + data_size,
+                        "metadata_bytes": 0,
+                        "tensor_bytes": data_size,
+                        "tensor_count": None,
+                        "header_read_seconds": 0.0,
+                        "metadata_read_seconds": 0.0,
+                        "tensor_read_seconds": 0.0,
+                        "cpu_tensor_bytes": data_size,
+                        "gpu_tensor_bytes": 0,
+                        "cpu_copy_seconds": 0.0,
+                        "gpu_copy_seconds": 0.0,
+                        "direct_read_seconds": 0.0,
+                        "direct_read_bw_gib_s": 0.0,
+                        "direct_read_path": "legacy_blob_load",
+                        "load_format": "legacy_torch_blob",
+                    }
+                load_end = time.perf_counter()
+                load_seconds = load_end - load_start
+                load_stats.update(
+                    {
+                        "rank": self.rank,
+                        "local_rank": self.local_rank,
+                        "iteration": iteration,
+                        "local_slot": best_slot,
+                        "backend_slot": self._backend_slot_ids[best_slot],
+                        "source_rank": restore_source_rank,
+                        "load_seconds": load_seconds,
+                        "load_bw_gib_s": (
+                            (float(load_stats.get("total_bytes", 0)) / (1024 ** 3)) / load_seconds
+                            if load_seconds > 0
+                            else 0.0
+                        ),
+                    }
+                )
+                self._last_load_stats = load_stats
                 logger.info(
                     f"[MCORE][EGM] Loaded checkpoint from slot {best_slot}: "
                     f"iteration={iteration}, source_rank={restore_source_rank}"
@@ -734,24 +782,33 @@ class EGMCheckpointManager:
             },
         )
 
-    def _deserialize_structured_payload(
-        self, payload: bytes, trailer_bytes: bytes
-    ) -> Dict[str, Any]:
+    def _deserialize_structured_slot(
+        self, slot: int, trailer_bytes: bytes
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
         metadata_size, _, _, _ = struct.unpack(
             _STRUCTURED_TRAILER_FORMAT,
             trailer_bytes[:_STRUCTURED_TRAILER_SIZE],
         )
         metadata_size = int(metadata_size)
-        metadata_blob = payload[:metadata_size]
+        header_read_start = time.perf_counter()
+        metadata_blob = self._read_slot_byte_range(slot, _HEADER_SIZE, metadata_size)
+        header_read_end = time.perf_counter()
+        if metadata_blob is None or len(metadata_blob) != metadata_size:
+            raise RuntimeError(
+                f"Failed to read structured metadata from slot {slot}: "
+                f"expected {metadata_size} bytes, got "
+                f"{0 if metadata_blob is None else len(metadata_blob)}"
+            )
         metadata_obj = pickle.loads(metadata_blob)
-        payload_base_offset = metadata_size
-
-        py_bytes_as_string = ctypes.pythonapi.PyBytes_AsString
-        py_bytes_as_string.restype = ctypes.c_void_p
-        py_bytes_as_string.argtypes = [ctypes.py_object]
-        payload_ptr = int(py_bytes_as_string(payload))
+        payload_base_ptr = self._get_slot_base_ptr(slot)
+        if payload_base_ptr is None:
+            raise RuntimeError(f"Failed to access base pointer for slot {slot}")
+        tensor_data_base_ptr = payload_base_ptr + _HEADER_SIZE + metadata_size
+        cpu_copy_seconds = 0.0
+        cpu_copy_bytes = 0
 
         def _decode(obj: Any) -> Any:
+            nonlocal cpu_copy_seconds, cpu_copy_bytes
             if isinstance(obj, dict) and obj.get("__egm_tensor__") is True:
                 dtype = _dtype_from_string(str(obj["dtype"]))
                 numel = int(obj["numel"])
@@ -760,11 +817,15 @@ class EGMCheckpointManager:
                 offset = int(obj["offset"])
                 tensor = torch.empty(numel, dtype=dtype, device="cpu")
                 if nbytes > 0:
+                    copy_start = time.perf_counter()
                     ctypes.memmove(
                         int(tensor.data_ptr()),
-                        payload_ptr + payload_base_offset + offset,
+                        tensor_data_base_ptr + offset,
                         nbytes,
                     )
+                    copy_end = time.perf_counter()
+                    cpu_copy_seconds += copy_end - copy_start
+                    cpu_copy_bytes += nbytes
                 return tensor.view(shape)
             if isinstance(obj, dict):
                 return {k: _decode(v) for k, v in obj.items()}
@@ -776,7 +837,64 @@ class EGMCheckpointManager:
 
         decoded = _decode(metadata_obj)
         assert isinstance(decoded, dict), type(decoded)
-        return decoded
+        load_stats = {
+            "payload_bytes": metadata_size + cpu_copy_bytes,
+            "total_bytes": _HEADER_SIZE + metadata_size + cpu_copy_bytes,
+            "metadata_bytes": metadata_size,
+            "tensor_bytes": cpu_copy_bytes,
+            "tensor_count": self._count_structured_tensors(metadata_obj),
+            "header_read_seconds": 0.0,
+            "metadata_read_seconds": header_read_end - header_read_start,
+            "tensor_read_seconds": cpu_copy_seconds,
+            "cpu_tensor_bytes": cpu_copy_bytes,
+            "gpu_tensor_bytes": 0,
+            "cpu_copy_seconds": cpu_copy_seconds,
+            "gpu_copy_seconds": 0.0,
+            "direct_read_seconds": cpu_copy_seconds,
+            "direct_read_bw_gib_s": (
+                (cpu_copy_bytes / (1024 ** 3)) / cpu_copy_seconds
+                if cpu_copy_seconds > 0 and cpu_copy_bytes > 0
+                else 0.0
+            ),
+            "direct_read_path": "structured_egm_to_cpu_memcpy",
+            "load_format": "structured_tensor_stream",
+        }
+        return decoded, load_stats
+
+    def _get_slot_base_ptr(self, slot: int) -> Optional[int]:
+        if slot < 0 or slot >= len(self._slot_metadata):
+            return None
+        if self._egm_manager is not None:
+            backend_slot = self._backend_slot_ids[slot]
+            return int(self._egm_manager.slots[backend_slot].va_addr)
+        if self._egm_client is not None:
+            mapping = self._imported_slot_mappings[slot]
+            if mapping is not None:
+                return int(mapping.va_addr)
+        return None
+
+    def _read_slot_byte_range(self, slot: int, offset: int, size: int) -> Optional[bytes]:
+        if size < 0 or offset < 0:
+            return None
+        base_ptr = self._get_slot_base_ptr(slot)
+        if base_ptr is not None:
+            return ctypes.string_at(base_ptr + offset, size)
+        raw_data = self._read_raw_slot_data_internal(slot)
+        if raw_data is None:
+            return None
+        end = offset + size
+        return raw_data[offset:end]
+
+    def _count_structured_tensors(self, obj: Any) -> int:
+        if isinstance(obj, dict):
+            if obj.get("__egm_tensor__") is True:
+                return 1
+            return sum(self._count_structured_tensors(v) for v in obj.values())
+        if isinstance(obj, list):
+            return sum(self._count_structured_tensors(v) for v in obj)
+        if isinstance(obj, tuple):
+            return sum(self._count_structured_tensors(v) for v in obj)
+        return 0
 
     def _resolve_restore_source_rank(self) -> int:
         if self._explicit_restore_source_rank is not None:
