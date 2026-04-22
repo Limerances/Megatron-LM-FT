@@ -26,6 +26,8 @@ if [[ -z "${EGM_SOCKET_PATH_TEMPLATE}" ]]; then
         EGM_SOCKET_PATH_TEMPLATE="${EGM_SOCKET_PATH}.numa{numa}"
     fi
 fi
+export EGM_SOCKET_PATH_TEMPLATE
+export EGM_AUTO_TOPOLOGY
 
 declare -a EGM_DAEMON_PIDS=()
 declare -a EGM_DAEMON_SOCKETS=()
@@ -98,9 +100,10 @@ if [[ "${EGM_AUTO_TOPOLOGY}" == "1" ]]; then
     export FT_EGM_AUTO_TOPOLOGY=1
     export FT_EGM_DAEMON_SOCKET_TEMPLATE="${EGM_SOCKET_PATH_TEMPLATE}"
 
-    mapfile -t TOPOLOGY_LINES < <(
+    TOPOLOGY_JSON="$(
         python3 - <<'PY'
 import os
+import json
 from collections import OrderedDict
 
 try:
@@ -125,6 +128,7 @@ if norm(err) != cuda_driver.CUresult.CUDA_SUCCESS:
     raise SystemExit(f"cuDeviceGetCount failed: {err}")
 
 groups = OrderedDict()
+device_entries = []
 for dev_idx in range(int(count)):
     err, dev = cuda_driver.cuDeviceGet(dev_idx)
     if norm(err) != cuda_driver.CUresult.CUDA_SUCCESS:
@@ -139,22 +143,58 @@ for dev_idx in range(int(count)):
     if numa not in groups:
         groups[numa] = {"device": dev_idx, "count": 0}
     groups[numa]["count"] += 1
+    socket_path = template.format(numa=numa, device=groups[numa]["device"])
+    device_entries.append(
+        {
+            "local_rank": dev_idx,
+            "device": dev_idx,
+            "numa": numa,
+            "socket": socket_path,
+        }
+    )
 
+daemon_entries = []
 for numa, info in groups.items():
     socket_path = template.format(numa=numa, device=info["device"])
     total_slots = info["count"] * num_slots
-    print(f"{numa}\t{info['device']}\t{info['count']}\t{total_slots}\t{socket_path}")
-PY
+    daemon_entries.append(
+        {
+            "numa": numa,
+            "device": info["device"],
+            "count": info["count"],
+            "slots": total_slots,
+            "socket": socket_path,
+        }
     )
 
-    if [[ "${#TOPOLOGY_LINES[@]}" -eq 0 ]]; then
+print(json.dumps({"daemons": daemon_entries, "devices": device_entries}))
+PY
+    )"
+
+    if [[ -z "${TOPOLOGY_JSON}" ]]; then
         echo "Failed to detect EGM topology; no daemon groups were created." >&2
         exit 1
     fi
 
-    local_line=""
-    for local_line in "${TOPOLOGY_LINES[@]}"; do
-        IFS=$'\t' read -r daemon_numa daemon_device daemon_count daemon_slots daemon_socket <<<"${local_line}"
+    export FT_EGM_LOCAL_RANK_SOCKET_MAP="$(
+        python3 - <<'PY' "${TOPOLOGY_JSON}"
+import json
+import sys
+topology = json.loads(sys.argv[1])
+print(json.dumps({str(d["local_rank"]): d["socket"] for d in topology["devices"]}))
+PY
+    )"
+    export FT_EGM_LOCAL_RANK_NUMA_MAP="$(
+        python3 - <<'PY' "${TOPOLOGY_JSON}"
+import json
+import sys
+topology = json.loads(sys.argv[1])
+print(json.dumps({str(d["local_rank"]): int(d["numa"]) for d in topology["devices"]}))
+PY
+    )"
+
+    while IFS=$'\t' read -r daemon_numa daemon_device daemon_count daemon_slots daemon_socket; do
+        [[ -z "${daemon_socket}" ]] && continue
         echo "Starting EGM daemon for NUMA ${daemon_numa} using device ${daemon_device} (${daemon_count} local GPU(s), slots=${daemon_slots}) at ${daemon_socket}"
         (
             cd "${ROOT_DIR}"
@@ -169,7 +209,15 @@ PY
         EGM_DAEMON_PIDS+=("${daemon_pid}")
         EGM_DAEMON_SOCKETS+=("${daemon_socket}")
         wait_for_socket "${daemon_socket}" "${daemon_pid}"
-    done
+    done < <(
+        python3 - <<'PY' "${TOPOLOGY_JSON}"
+import json
+import sys
+topology = json.loads(sys.argv[1])
+for d in topology["daemons"]:
+    print(f'{d["numa"]}\t{d["device"]}\t{d["count"]}\t{d["slots"]}\t{d["socket"]}')
+PY
+    )
 else
     export FT_EGM_AUTO_TOPOLOGY=0
     DAEMON_CMD=(

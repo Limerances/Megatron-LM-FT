@@ -19,7 +19,9 @@ import signal
 import sys
 import time
 from logging import getLogger
+import json
 from typing import Any, Dict, Optional, Set
+
 
 import torch
 
@@ -156,6 +158,22 @@ def _resolve_egm_topology(
     device_id: int,
 ) -> tuple[str, int]:
     auto_topology = os.environ.get("FT_EGM_AUTO_TOPOLOGY", "0") == "1"
+    local_rank_socket_map = os.environ.get("FT_EGM_LOCAL_RANK_SOCKET_MAP")
+    local_rank_numa_map = os.environ.get("FT_EGM_LOCAL_RANK_NUMA_MAP")
+    if auto_topology and local_rank_socket_map and local_rank_numa_map:
+        try:
+            socket_map = json.loads(local_rank_socket_map)
+            numa_map = json.loads(local_rank_numa_map)
+            mapped_socket = socket_map.get(str(local_rank))
+            mapped_numa = numa_map.get(str(local_rank))
+            if mapped_socket is not None and mapped_numa is not None:
+                return str(mapped_socket), int(mapped_numa)
+        except Exception as e:
+            logger.warning(
+                f"EGM: failed to parse local-rank topology mapping; "
+                f"falling back to runtime detection: {e}"
+            )
+
     detected_numa = _detect_host_numa_id(device_id)
 
     resolved_numa = numa_node_id
