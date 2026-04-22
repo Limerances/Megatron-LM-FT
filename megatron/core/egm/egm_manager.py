@@ -331,7 +331,9 @@ class EGMManager:
                 mem_handle=mem_handle,
                 shareable_handle=shareable_handle,
                 va_addr=va_addr,
-                host_payload=bytearray(slot_size),
+                # Avoid allocating a huge Python bytearray for each slot in the daemon.
+                # The authoritative bytes live in the mapped EGM VA range (slot.va_addr).
+                host_payload=None,
             )
             self._slots.append(slot)
             logger.info(
@@ -499,16 +501,18 @@ class EGMManager:
                 return None
 
     def _write_slot_bytes(self, slot: EGMSlot, data: bytes) -> None:
-        if slot.host_payload is None or len(slot.host_payload) < slot.size_bytes:
-            slot.host_payload = bytearray(slot.size_bytes)
-        slot.host_payload[:len(data)] = data
-        if len(data) < slot.size_bytes:
-            slot.host_payload[len(data):slot.size_bytes] = b"\0" * (
-                slot.size_bytes - len(data)
-            )
-
+        # IMPORTANT: never memset/zero-fill the rest of the slot here.
+        # The reader always uses slot.total_bytes, so writing extra gigabytes of zeros
+        # would dominate checkpoint time and make bandwidth look terrible.
         if _cuda_driver_available and slot.va_addr:
             ctypes.memmove(slot.va_addr, data, len(data))
+            return
+
+        # Stub / fallback path: keep a Python-side copy for readback.
+        # Allocate lazily to avoid huge memory overhead when CUDA driver path is available.
+        if slot.host_payload is None or len(slot.host_payload) < len(data):
+            slot.host_payload = bytearray(len(data))
+        slot.host_payload[:len(data)] = data
 
     def _read_slot_bytes(self, slot: EGMSlot, total_bytes: int) -> bytes:
         if _cuda_driver_available and slot.va_addr:

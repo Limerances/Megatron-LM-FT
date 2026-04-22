@@ -502,6 +502,16 @@ def _save_egm_checkpoint(iteration, model, optimizer, opt_param_scheduler) -> No
             end_to_end_bw_gib_s = (
                 total_gib / total_s if total_s > 0 else 0.0
             )
+            direct_copy_s = save_stats.get("direct_copy_seconds")
+            direct_copy_bw = save_stats.get("direct_copy_bw_gib_s")
+            direct_copy_path = save_stats.get("direct_copy_path")
+            direct_copy_str = ""
+            if direct_copy_s is not None and direct_copy_bw is not None:
+                direct_copy_str = (
+                    f" | direct_copy={float(direct_copy_s):.6f} s"
+                    f" | direct_copy_bw={float(direct_copy_bw):.3f} GiB/s"
+                    f" | direct_path={direct_copy_path}"
+                )
             print(
                 "EGM_SAVE_STATS"
                 f" | rank={rank} (local_rank={local_rank})"
@@ -513,7 +523,8 @@ def _save_egm_checkpoint(iteration, model, optimizer, opt_param_scheduler) -> No
                 f" | total={total_s:.3f} s"
                 f" | wall={wall_s:.3f} s"
                 f" | write_bw={write_bw_gib_s:.3f} GiB/s"
-                f" | end_to_end_bw={end_to_end_bw_gib_s:.3f} GiB/s",
+                f" | end_to_end_bw={end_to_end_bw_gib_s:.3f} GiB/s"
+                f"{direct_copy_str}",
                 flush=True,
             )
         elif save_time is not None:

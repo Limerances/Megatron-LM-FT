@@ -205,7 +205,7 @@ class EGMCheckpointManager:
                 header = _build_header(iteration, len(data), checksum, self.rank)
                 raw_bytes = header + data
                 write_start = time.perf_counter()
-                slot = self._write_raw_slot_data_internal(
+                slot, copy_stats = self._write_raw_slot_data_internal(
                     self._current_write_slot, raw_bytes, iteration
                 )
                 write_end = time.perf_counter()
@@ -213,22 +213,38 @@ class EGMCheckpointManager:
                     return False
 
                 backend_slot = self._backend_slot_ids[slot]
+                total_bytes = len(raw_bytes)
+                payload_bytes = len(data)
+                write_seconds = write_end - write_start
+                total_seconds = write_end - serialize_start
+                # "Write bandwidth" here is for the raw EGM write path (not serialization).
+                write_bw_gib_s = (
+                    (total_bytes / (1024 ** 3)) / write_seconds if write_seconds > 0 else 0.0
+                )
+
                 self._last_save_stats = {
                     "rank": self.rank,
                     "local_rank": self.local_rank,
                     "iteration": iteration,
                     "local_slot": slot,
                     "backend_slot": backend_slot,
-                    "payload_bytes": len(data),
-                    "total_bytes": len(raw_bytes),
+                    "payload_bytes": payload_bytes,
+                    "total_bytes": total_bytes,
                     "serialize_seconds": serialize_end - serialize_start,
-                    "write_seconds": write_end - write_start,
-                    "total_seconds": write_end - serialize_start,
+                    "write_seconds": write_seconds,
+                    "total_seconds": total_seconds,
+                    "write_bw_gib_s": write_bw_gib_s,
                 }
+                if copy_stats is not None:
+                    # Extra breakdown for the daemon-mapped fast path (direct memmove into EGM VA).
+                    self._last_save_stats.update(copy_stats)
                 logger.info(
                     f"[MCORE][EGM] Saved checkpoint to local_slot={slot} "
                     f"backend_slot={backend_slot}: iteration={iteration}, "
-                    f"data_size={len(data)}"
+                    f"payload_bytes={payload_bytes}, total_bytes={total_bytes}, "
+                    f"serialize_s={serialize_end - serialize_start:.6f}, "
+                    f"write_s={write_seconds:.6f}, "
+                    f"write_bw={write_bw_gib_s:.3f} GiB/s"
                 )
                 return True
 
@@ -562,9 +578,9 @@ class EGMCheckpointManager:
 
     def _write_raw_slot_data_internal(
         self, local_slot: Optional[int], data: bytes, fallback_iteration: int = -1
-    ) -> Optional[int]:
+    ) -> tuple[Optional[int], Optional[Dict[str, Any]]]:
         if len(data) > self._slot_capacity_bytes:
-            return None
+            return None, None
 
         parsed_iteration = fallback_iteration
         parsed_data_size = max(len(data) - _HEADER_SIZE, 0)
@@ -580,7 +596,7 @@ class EGMCheckpointManager:
                 actual_checksum = _compute_checksum(payload)
                 if actual_checksum != checksum:
                     logger.error("[MCORE][EGM] checksum mismatch while writing raw slot data")
-                    return None
+                    return None, None
                 parsed_iteration = int(iter_val)
                 parsed_data_size = int(data_size)
                 source_rank = int(reserved)
@@ -590,14 +606,15 @@ class EGMCheckpointManager:
         if local_slot is None or local_slot < 0 or local_slot >= self.config.num_slots:
             local_slot = self._current_write_slot
         backend_slot_id = self._backend_slot_ids[local_slot]
+        copy_stats: Optional[Dict[str, Any]] = None
 
         if self._egm_manager is not None:
             manager_slot = self._egm_manager.slots[backend_slot_id]
             manager_slot.force_release()
             if not manager_slot.acquire(pid):
-                return None
+                return None, None
             if not manager_slot.begin_write(pid):
-                return None
+                return None, None
             if not self._egm_manager.write_raw_slot_data(
                 backend_slot_id,
                 pid,
@@ -607,20 +624,34 @@ class EGMCheckpointManager:
                 source_rank=source_rank,
                 checksum_hex=checksum_hex,
             ):
-                return None
+                return None, None
             if not manager_slot.commit(pid):
-                return None
+                return None, None
         elif self._egm_client is not None:
             self._egm_client.release_slot(backend_slot_id, pid)
             acquire_resp = self._egm_client.acquire_specific_slot(backend_slot_id, pid)
             if acquire_resp.get("status") != "ok":
-                return None
+                return None, None
             begin_resp = self._egm_client.begin_write(backend_slot_id, pid)
             if begin_resp.get("status") != "ok":
-                return None
+                return None, None
             mapping = self._imported_slot_mappings[local_slot]
             if mapping is not None:
+                # Fast path: training process directly writes into the imported EGM VA.
+                # Measure this separately to approximate the real memory write bandwidth.
+                copy_start = time.perf_counter()
                 ctypes.memmove(mapping.va_addr, data, len(data))
+                copy_end = time.perf_counter()
+                copy_s = copy_end - copy_start
+                copy_bw_gib_s = (
+                    (len(data) / (1024 ** 3)) / copy_s if copy_s > 0 else 0.0
+                )
+                copy_stats = {
+                    "direct_copy_seconds": copy_s,
+                    "direct_copy_bw_gib_s": copy_bw_gib_s,
+                    "direct_copy_bytes": len(data),
+                    "direct_copy_path": "daemon_imported_va_memmove",
+                }
                 meta_resp = self._egm_client.update_slot_metadata(
                     backend_slot_id,
                     iteration=parsed_iteration,
@@ -631,7 +662,7 @@ class EGMCheckpointManager:
                     pid=pid,
                 )
                 if meta_resp.get("status") != "ok":
-                    return None
+                    return None, None
             else:
                 write_resp = self._egm_client.write_raw_slot_data(
                     backend_slot_id,
@@ -643,10 +674,10 @@ class EGMCheckpointManager:
                     pid=pid,
                 )
                 if write_resp.get("status") != "ok":
-                    return None
+                    return None, None
             commit_resp = self._egm_client.commit_slot(backend_slot_id, pid)
             if commit_resp.get("status") != "ok":
-                return None
+                return None, None
         else:
             buf = self._slot_buffers[local_slot]
             if buf is None:
@@ -662,7 +693,7 @@ class EGMCheckpointManager:
             source_rank=source_rank,
         )
         self._current_write_slot = (local_slot + 1) % self.config.num_slots
-        return local_slot
+        return local_slot, copy_stats
 
     def _read_raw_slot_data_internal(self, slot: int) -> Optional[bytes]:
         if slot < 0 or slot >= len(self._slot_metadata):
