@@ -806,26 +806,58 @@ class EGMCheckpointManager:
         tensor_data_base_ptr = payload_base_ptr + _HEADER_SIZE + metadata_size
         cpu_copy_seconds = 0.0
         cpu_copy_bytes = 0
+        gpu_copy_bytes = 0
+        gpu_copy_begin = 0.0
+        gpu_copy_end = 0.0
+
+        def _target_device(storage_device: str) -> torch.device:
+            if storage_device == "cuda":
+                return torch.device("cuda", self.device_id)
+            if storage_device == "cpu":
+                return torch.device("cpu")
+            raise RuntimeError(
+                f"Unsupported storage_device in structured EGM checkpoint: "
+                f"{storage_device}"
+            )
 
         def _decode(obj: Any) -> Any:
             nonlocal cpu_copy_seconds, cpu_copy_bytes
+            nonlocal gpu_copy_begin, gpu_copy_end, gpu_copy_bytes
             if isinstance(obj, dict) and obj.get("__egm_tensor__") is True:
                 dtype = _dtype_from_string(str(obj["dtype"]))
                 numel = int(obj["numel"])
                 nbytes = int(obj["nbytes"])
                 shape = tuple(int(v) for v in obj["shape"])
                 offset = int(obj["offset"])
-                tensor = torch.empty(numel, dtype=dtype, device="cpu")
+                storage_device = str(obj.get("storage_device", "cpu"))
+                tensor = torch.empty(
+                    numel,
+                    dtype=dtype,
+                    device=_target_device(storage_device),
+                )
                 if nbytes > 0:
-                    copy_start = time.perf_counter()
-                    ctypes.memmove(
-                        int(tensor.data_ptr()),
-                        tensor_data_base_ptr + offset,
-                        nbytes,
-                    )
-                    copy_end = time.perf_counter()
-                    cpu_copy_seconds += copy_end - copy_start
-                    cpu_copy_bytes += nbytes
+                    if tensor.device.type == "cuda":
+                        if gpu_copy_bytes == 0:
+                            gpu_copy_begin = time.perf_counter()
+                        err = cuda_driver.cuMemcpyDtoDAsync(
+                            int(tensor.data_ptr()),
+                            tensor_data_base_ptr + offset,
+                            nbytes,
+                            0,
+                        )
+                        if not _cuda_call_succeeded(err):
+                            raise RuntimeError(f"cuMemcpyDtoDAsync failed while loading: {err}")
+                        gpu_copy_bytes += nbytes
+                    else:
+                        copy_start = time.perf_counter()
+                        ctypes.memmove(
+                            int(tensor.data_ptr()),
+                            tensor_data_base_ptr + offset,
+                            nbytes,
+                        )
+                        copy_end = time.perf_counter()
+                        cpu_copy_seconds += copy_end - copy_start
+                        cpu_copy_bytes += nbytes
                 return tensor.view(shape)
             if isinstance(obj, dict):
                 return {k: _decode(v) for k, v in obj.items()}
@@ -836,27 +868,52 @@ class EGMCheckpointManager:
             return obj
 
         decoded = _decode(metadata_obj)
+        gpu_copy_seconds = 0.0
+        if gpu_copy_bytes > 0:
+            torch.cuda.synchronize(device=self.device_id)
+            gpu_copy_end = time.perf_counter()
+            gpu_copy_seconds = gpu_copy_end - gpu_copy_begin
         assert isinstance(decoded, dict), type(decoded)
         load_stats = {
-            "payload_bytes": metadata_size + cpu_copy_bytes,
-            "total_bytes": _HEADER_SIZE + metadata_size + cpu_copy_bytes,
+            "payload_bytes": metadata_size + cpu_copy_bytes + gpu_copy_bytes,
+            "total_bytes": _HEADER_SIZE + metadata_size + cpu_copy_bytes + gpu_copy_bytes,
             "metadata_bytes": metadata_size,
-            "tensor_bytes": cpu_copy_bytes,
+            "tensor_bytes": cpu_copy_bytes + gpu_copy_bytes,
             "tensor_count": self._count_structured_tensors(metadata_obj),
             "header_read_seconds": 0.0,
             "metadata_read_seconds": header_read_end - header_read_start,
-            "tensor_read_seconds": cpu_copy_seconds,
+            "tensor_read_seconds": cpu_copy_seconds + gpu_copy_seconds,
             "cpu_tensor_bytes": cpu_copy_bytes,
-            "gpu_tensor_bytes": 0,
+            "gpu_tensor_bytes": gpu_copy_bytes,
             "cpu_copy_seconds": cpu_copy_seconds,
-            "gpu_copy_seconds": 0.0,
-            "direct_read_seconds": cpu_copy_seconds,
-            "direct_read_bw_gib_s": (
+            "gpu_copy_seconds": gpu_copy_seconds,
+            "cpu_copy_bw_gib_s": (
                 (cpu_copy_bytes / (1024 ** 3)) / cpu_copy_seconds
                 if cpu_copy_seconds > 0 and cpu_copy_bytes > 0
                 else 0.0
             ),
-            "direct_read_path": "structured_egm_to_cpu_memcpy",
+            "gpu_copy_bw_gib_s": (
+                (gpu_copy_bytes / (1024 ** 3)) / gpu_copy_seconds
+                if gpu_copy_seconds > 0 and gpu_copy_bytes > 0
+                else 0.0
+            ),
+            "direct_read_seconds": (
+                gpu_copy_seconds if gpu_copy_bytes > 0 else cpu_copy_seconds
+            ),
+            "direct_read_bw_gib_s": (
+                ((gpu_copy_bytes if gpu_copy_bytes > 0 else cpu_copy_bytes) / (1024 ** 3))
+                / (gpu_copy_seconds if gpu_copy_bytes > 0 else cpu_copy_seconds)
+                if (
+                    (gpu_copy_bytes > 0 and gpu_copy_seconds > 0)
+                    or (cpu_copy_bytes > 0 and cpu_copy_seconds > 0)
+                )
+                else 0.0
+            ),
+            "direct_read_path": (
+                "structured_egm_to_cuda_tensor"
+                if gpu_copy_bytes > 0
+                else "structured_egm_to_cpu_memcpy"
+            ),
             "load_format": "structured_tensor_stream",
         }
         return decoded, load_stats

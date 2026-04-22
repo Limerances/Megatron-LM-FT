@@ -23,6 +23,19 @@ from typing import Any, Dict, Optional, Set
 
 import torch
 
+try:
+    import cuda.bindings.driver as cuda_driver
+
+    _cuda_driver_available = True
+except ImportError:
+    try:
+        import cuda.cuda as cuda_driver
+
+        _cuda_driver_available = True
+    except ImportError:
+        cuda_driver = None
+        _cuda_driver_available = False
+
 from . import global_vars
 from .global_vars import get_args, get_timers
 from .utils import print_rank_0
@@ -104,6 +117,73 @@ def classify_fault_type(exc: BaseException) -> str:
     return "crash"
 
 
+def _normalize_cuda_err(err):
+    if isinstance(err, tuple):
+        if len(err) == 0:
+            return None
+        return err[0]
+    return err
+
+
+def _detect_host_numa_id(device_id: int) -> Optional[int]:
+    if not _cuda_driver_available:
+        return None
+    try:
+        err = cuda_driver.cuInit(0)
+        if _normalize_cuda_err(err) != cuda_driver.CUresult.CUDA_SUCCESS:
+            return None
+        err, dev = cuda_driver.cuDeviceGet(device_id)
+        if _normalize_cuda_err(err) != cuda_driver.CUresult.CUDA_SUCCESS:
+            return None
+        err, numa_id = cuda_driver.cuDeviceGetAttribute(
+            cuda_driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID,
+            dev,
+        )
+        if _normalize_cuda_err(err) != cuda_driver.CUresult.CUDA_SUCCESS:
+            return None
+        return int(numa_id)
+    except Exception as e:
+        logger.warning(f"EGM: failed to detect host NUMA id for device {device_id}: {e}")
+        return None
+
+
+def _resolve_egm_topology(
+    *,
+    daemon_socket_path: str,
+    numa_node_id: int,
+    rank: int,
+    local_rank: int,
+    device_id: int,
+) -> tuple[str, int]:
+    auto_topology = os.environ.get("FT_EGM_AUTO_TOPOLOGY", "0") == "1"
+    detected_numa = _detect_host_numa_id(device_id)
+
+    resolved_numa = numa_node_id
+    if auto_topology and detected_numa is not None:
+        resolved_numa = detected_numa
+    elif numa_node_id < 0 and detected_numa is not None:
+        resolved_numa = detected_numa
+
+    template = os.environ.get("FT_EGM_DAEMON_SOCKET_TEMPLATE")
+    resolved_socket_path = daemon_socket_path
+    if auto_topology and template:
+        resolved_socket_path = template.format(
+            rank=rank,
+            local_rank=local_rank,
+            device=device_id,
+            numa=resolved_numa,
+        )
+    elif "{" in daemon_socket_path and "}" in daemon_socket_path:
+        resolved_socket_path = daemon_socket_path.format(
+            rank=rank,
+            local_rank=local_rank,
+            device=device_id,
+            numa=resolved_numa,
+        )
+
+    return resolved_socket_path, resolved_numa
+
+
 def setup(args) -> None:
     if not getattr(args, 'enable_egm_checkpoint', False):
         return
@@ -138,6 +218,16 @@ def setup(args) -> None:
         local_rank = int(os.environ.get("LOCAL_RANK", rank))
     device_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
 
+    daemon_socket_path, numa_node_id = _resolve_egm_topology(
+        daemon_socket_path=daemon_socket_path,
+        numa_node_id=numa_node_id,
+        rank=rank,
+        local_rank=local_rank,
+        device_id=device_id,
+    )
+    config.daemon_socket_path = daemon_socket_path
+    config.numa_node_id = numa_node_id
+
     manager = EGMCheckpointManager(
         config=config,
         device_id=device_id,
@@ -150,7 +240,8 @@ def setup(args) -> None:
     if use_daemon:
         print_rank_0(
             f"EGM: initialized in DAEMON mode, connected to {daemon_socket_path}. "
-            f"Checkpoint memory is held by external daemon — survives training crashes."
+            f"Checkpoint memory is held by external daemon — survives training crashes. "
+            f"(device={device_id}, local_rank={local_rank}, numa={numa_node_id})"
         )
     else:
         print_rank_0(
