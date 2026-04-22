@@ -502,6 +502,13 @@ def _save_egm_checkpoint(iteration, model, optimizer, opt_param_scheduler) -> No
             end_to_end_bw_gib_s = (
                 total_gib / total_s if total_s > 0 else 0.0
             )
+            tensor_count = save_stats.get("tensor_count")
+            tensor_bytes = save_stats.get("tensor_bytes")
+            gpu_copy_bw = save_stats.get("gpu_copy_bw_gib_s")
+            gpu_tensor_bytes = save_stats.get("gpu_tensor_bytes")
+            cpu_copy_bw = save_stats.get("cpu_copy_bw_gib_s")
+            cpu_tensor_bytes = save_stats.get("cpu_tensor_bytes")
+            save_format = save_stats.get("save_format")
             direct_copy_s = save_stats.get("direct_copy_seconds")
             direct_copy_bw = save_stats.get("direct_copy_bw_gib_s")
             direct_copy_path = save_stats.get("direct_copy_path")
@@ -511,6 +518,17 @@ def _save_egm_checkpoint(iteration, model, optimizer, opt_param_scheduler) -> No
                     f" | direct_copy={float(direct_copy_s):.6f} s"
                     f" | direct_copy_bw={float(direct_copy_bw):.3f} GiB/s"
                     f" | direct_path={direct_copy_path}"
+                )
+            structured_str = ""
+            if tensor_count is not None:
+                structured_str = (
+                    f" | format={save_format}"
+                    f" | tensor_count={int(tensor_count)}"
+                    f" | tensor_bytes={(float(tensor_bytes) / (1024 ** 3)) if tensor_bytes is not None else 0.0:.3f} GiB"
+                    f" | gpu_tensor_bytes={(float(gpu_tensor_bytes) / (1024 ** 3)) if gpu_tensor_bytes is not None else 0.0:.3f} GiB"
+                    f" | gpu_copy_bw={float(gpu_copy_bw) if gpu_copy_bw is not None else 0.0:.3f} GiB/s"
+                    f" | cpu_tensor_bytes={(float(cpu_tensor_bytes) / (1024 ** 3)) if cpu_tensor_bytes is not None else 0.0:.3f} GiB"
+                    f" | cpu_copy_bw={float(cpu_copy_bw) if cpu_copy_bw is not None else 0.0:.3f} GiB/s"
                 )
             print(
                 "EGM_SAVE_STATS"
@@ -524,6 +542,7 @@ def _save_egm_checkpoint(iteration, model, optimizer, opt_param_scheduler) -> No
                 f" | wall={wall_s:.3f} s"
                 f" | write_bw={write_bw_gib_s:.3f} GiB/s"
                 f" | end_to_end_bw={end_to_end_bw_gib_s:.3f} GiB/s"
+                f"{structured_str}"
                 f"{direct_copy_str}",
                 flush=True,
             )

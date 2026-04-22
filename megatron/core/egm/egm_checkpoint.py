@@ -7,6 +7,7 @@ import io
 import json
 import os
 import copy
+import pickle
 import struct
 import threading
 import time
@@ -37,7 +38,10 @@ _HEADER_STRUCT_FORMAT = "<IIQQQ"
 _HEADER_STRUCT_SIZE = struct.calcsize(_HEADER_STRUCT_FORMAT)  # 32
 _CHECKSUM_SIZE = 32
 _HEADER_MAGIC = 0x45474D43
-_HEADER_VERSION = 2
+_HEADER_VERSION_LEGACY = 2
+_HEADER_VERSION_STRUCTURED = 3
+_STRUCTURED_TRAILER_FORMAT = "<QQQQ"
+_STRUCTURED_TRAILER_SIZE = struct.calcsize(_STRUCTURED_TRAILER_FORMAT)
 _EGM_ALIGNMENT = 2 * 1024 * 1024
 
 _SLOT_STATUS_FREE = 0
@@ -59,6 +63,18 @@ class _ImportedSlotMapping:
     imported_handle: Any
     va_addr: int
     size_bytes: int
+
+
+@dataclass
+class _TensorWritePlan:
+    placeholder_index: int
+    tensor: torch.Tensor
+    dtype_str: str
+    shape: tuple[int, ...]
+    numel: int
+    nbytes: int
+    offset: int
+    storage_device: str
 
 
 @dataclass
@@ -191,60 +207,31 @@ class EGMCheckpointManager:
 
         with self._lock:
             try:
-                serialize_start = time.perf_counter()
-                data = self._serialize_to_buffer(state_dict)
-                serialize_end = time.perf_counter()
-                if len(data) + _HEADER_SIZE > self._slot_capacity_bytes:
-                    logger.error(
-                        f"Data size ({len(data) + _HEADER_SIZE}) exceeds "
-                        f"slot capacity ({self._slot_capacity_bytes})"
+                slot, stats = self._save_state_dict_structured(state_dict, iteration)
+                if slot is None or stats is None:
+                    logger.warning(
+                        "[MCORE][EGM] Structured EGM save path unavailable; "
+                        "falling back to legacy torch.save(BytesIO) path"
                     )
-                    return False
-
-                checksum = _compute_checksum(data)
-                header = _build_header(iteration, len(data), checksum, self.rank)
-                raw_bytes = header + data
-                write_start = time.perf_counter()
-                slot, copy_stats = self._write_raw_slot_data_internal(
-                    self._current_write_slot, raw_bytes, iteration
-                )
-                write_end = time.perf_counter()
-                if slot is None:
-                    return False
+                    return self._save_state_dict_legacy(state_dict, iteration)
 
                 backend_slot = self._backend_slot_ids[slot]
-                total_bytes = len(raw_bytes)
-                payload_bytes = len(data)
-                write_seconds = write_end - write_start
-                total_seconds = write_end - serialize_start
-                # "Write bandwidth" here is for the raw EGM write path (not serialization).
-                write_bw_gib_s = (
-                    (total_bytes / (1024 ** 3)) / write_seconds if write_seconds > 0 else 0.0
+                stats.update(
+                    {
+                        "rank": self.rank,
+                        "local_rank": self.local_rank,
+                        "iteration": iteration,
+                        "local_slot": slot,
+                        "backend_slot": backend_slot,
+                    }
                 )
-
-                self._last_save_stats = {
-                    "rank": self.rank,
-                    "local_rank": self.local_rank,
-                    "iteration": iteration,
-                    "local_slot": slot,
-                    "backend_slot": backend_slot,
-                    "payload_bytes": payload_bytes,
-                    "total_bytes": total_bytes,
-                    "serialize_seconds": serialize_end - serialize_start,
-                    "write_seconds": write_seconds,
-                    "total_seconds": total_seconds,
-                    "write_bw_gib_s": write_bw_gib_s,
-                }
-                if copy_stats is not None:
-                    # Extra breakdown for the daemon-mapped fast path (direct memmove into EGM VA).
-                    self._last_save_stats.update(copy_stats)
+                self._last_save_stats = stats
                 logger.info(
-                    f"[MCORE][EGM] Saved checkpoint to local_slot={slot} "
+                    f"[MCORE][EGM] Saved structured checkpoint to local_slot={slot} "
                     f"backend_slot={backend_slot}: iteration={iteration}, "
-                    f"payload_bytes={payload_bytes}, total_bytes={total_bytes}, "
-                    f"serialize_s={serialize_end - serialize_start:.6f}, "
-                    f"write_s={write_seconds:.6f}, "
-                    f"write_bw={write_bw_gib_s:.3f} GiB/s"
+                    f"tensor_bytes={stats['tensor_bytes']}, metadata_bytes={stats['metadata_bytes']}, "
+                    f"write_s={stats['write_seconds']:.6f}, "
+                    f"write_bw={stats['write_bw_gib_s']:.3f} GiB/s"
                 )
                 return True
 
@@ -280,20 +267,21 @@ class EGMCheckpointManager:
                     return None
 
                 header_bytes = raw_data[:_HEADER_SIZE]
-                magic, version, iteration, data_size, reserved, stored_checksum = _parse_header(header_bytes)
+                magic, version, iteration, data_size, reserved, trailer = _parse_header(header_bytes)
 
                 if magic != _HEADER_MAGIC:
                     logger.error(f"[MCORE][EGM] Invalid magic: 0x{magic:x}")
                     return None
 
                 payload = raw_data[_HEADER_SIZE:_HEADER_SIZE + data_size]
-                actual_checksum = _compute_checksum(payload)
-
-                if actual_checksum != stored_checksum:
-                    logger.error("[MCORE][EGM] Checksum mismatch")
-                    return None
-
-                state_dict = self._deserialize_from_buffer(payload)
+                if version == _HEADER_VERSION_STRUCTURED:
+                    state_dict = self._deserialize_structured_payload(payload, trailer)
+                else:
+                    actual_checksum = _compute_checksum(payload)
+                    if actual_checksum != trailer:
+                        logger.error("[MCORE][EGM] Checksum mismatch")
+                        return None
+                    state_dict = self._deserialize_from_buffer(payload)
                 logger.info(
                     f"[MCORE][EGM] Loaded checkpoint from slot {best_slot}: "
                     f"iteration={iteration}, source_rank={restore_source_rank}"
@@ -366,7 +354,8 @@ class EGMCheckpointManager:
         cannot be parsed.
         """
         with self._lock:
-            return self._write_raw_slot_data_internal(slot, data, iteration) is not None
+            written_slot, _ = self._write_raw_slot_data_internal(slot, data, iteration)
+            return written_slot is not None
 
     def shutdown(self) -> None:
         if not self._initialized:
@@ -412,6 +401,382 @@ class EGMCheckpointManager:
     def _deserialize_from_buffer(self, data: bytes) -> Dict[str, Any]:
         buffer = io.BytesIO(data)
         return torch.load(buffer, map_location='cpu', weights_only=False)
+
+    def _save_state_dict_legacy(self, state_dict: Dict[str, Any], iteration: int) -> bool:
+        serialize_start = time.perf_counter()
+        data = self._serialize_to_buffer(state_dict)
+        serialize_end = time.perf_counter()
+        if len(data) + _HEADER_SIZE > self._slot_capacity_bytes:
+            logger.error(
+                f"Data size ({len(data) + _HEADER_SIZE}) exceeds "
+                f"slot capacity ({self._slot_capacity_bytes})"
+            )
+            return False
+
+        checksum = _compute_checksum(data)
+        header = _build_header(iteration, len(data), checksum, self.rank)
+        raw_bytes = header + data
+        write_start = time.perf_counter()
+        slot, copy_stats = self._write_raw_slot_data_internal(
+            self._current_write_slot, raw_bytes, iteration
+        )
+        write_end = time.perf_counter()
+        if slot is None:
+            return False
+
+        backend_slot = self._backend_slot_ids[slot]
+        total_bytes = len(raw_bytes)
+        payload_bytes = len(data)
+        write_seconds = write_end - write_start
+        total_seconds = write_end - serialize_start
+        write_bw_gib_s = (
+            (total_bytes / (1024 ** 3)) / write_seconds if write_seconds > 0 else 0.0
+        )
+
+        self._last_save_stats = {
+            "rank": self.rank,
+            "local_rank": self.local_rank,
+            "iteration": iteration,
+            "local_slot": slot,
+            "backend_slot": backend_slot,
+            "payload_bytes": payload_bytes,
+            "total_bytes": total_bytes,
+            "serialize_seconds": serialize_end - serialize_start,
+            "write_seconds": write_seconds,
+            "total_seconds": total_seconds,
+            "write_bw_gib_s": write_bw_gib_s,
+            "save_format": "legacy_torch_blob",
+        }
+        if copy_stats is not None:
+            self._last_save_stats.update(copy_stats)
+        return True
+
+    def _save_state_dict_structured(
+        self, state_dict: Dict[str, Any], iteration: int
+    ) -> tuple[Optional[int], Optional[Dict[str, Any]]]:
+        prepare_start = time.perf_counter()
+        prepared = self._prepare_structured_state_dict(state_dict)
+        if prepared is None:
+            return None, None
+        metadata_bytes, tensor_plans, total_tensor_bytes = prepared
+        prepare_end = time.perf_counter()
+
+        trailer = struct.pack(
+            _STRUCTURED_TRAILER_FORMAT,
+            len(metadata_bytes),
+            total_tensor_bytes,
+            len(tensor_plans),
+            0,
+        )
+        bytes_after_header = len(metadata_bytes) + total_tensor_bytes
+        total_bytes = _HEADER_SIZE + bytes_after_header
+        if total_bytes > self._slot_capacity_bytes:
+            logger.error(
+                f"Structured checkpoint size ({total_bytes}) exceeds "
+                f"slot capacity ({self._slot_capacity_bytes})"
+            )
+            return None, None
+
+        header = _build_structured_header(
+            iteration=iteration,
+            data_size=bytes_after_header,
+            source_rank=self.rank,
+            metadata_size=len(metadata_bytes),
+            tensor_data_bytes=total_tensor_bytes,
+            tensor_count=len(tensor_plans),
+        )
+
+        write_start = time.perf_counter()
+        slot, write_stats = self._write_structured_slot_data_internal(
+            self._current_write_slot,
+            header=header,
+            metadata_bytes=metadata_bytes,
+            tensor_plans=tensor_plans,
+            iteration=iteration,
+            bytes_after_header=bytes_after_header,
+            trailer_bytes=trailer,
+        )
+        write_end = time.perf_counter()
+        if slot is None or write_stats is None:
+            return None, None
+
+        write_seconds = write_end - write_start
+        total_seconds = write_end - prepare_start
+        stats: Dict[str, Any] = {
+            "payload_bytes": total_tensor_bytes,
+            "total_bytes": total_bytes,
+            "metadata_bytes": len(metadata_bytes),
+            "tensor_bytes": total_tensor_bytes,
+            "tensor_count": len(tensor_plans),
+            "prepare_seconds": prepare_end - prepare_start,
+            "serialize_seconds": prepare_end - prepare_start,
+            "write_seconds": write_seconds,
+            "total_seconds": total_seconds,
+            "write_bw_gib_s": (
+                (total_tensor_bytes / (1024 ** 3)) / write_seconds
+                if write_seconds > 0
+                else 0.0
+            ),
+            "save_format": "structured_tensor_stream",
+        }
+        stats.update(write_stats)
+        return slot, stats
+
+    def _prepare_structured_state_dict(
+        self, state_dict: Dict[str, Any]
+    ) -> Optional[tuple[bytes, List[_TensorWritePlan], int]]:
+        tensor_plans: List[_TensorWritePlan] = []
+        next_offset = 0
+
+        def _encode(obj: Any) -> Any:
+            nonlocal next_offset
+            if torch.is_tensor(obj):
+                if obj.layout != torch.strided:
+                    raise RuntimeError(
+                        f"Unsupported tensor layout for EGM structured checkpoint: "
+                        f"{obj.layout}"
+                    )
+                tensor = obj.detach().contiguous()
+                if tensor.device.type not in ("cpu", "cuda"):
+                    raise RuntimeError(
+                        f"Unsupported tensor device for EGM structured checkpoint: "
+                        f"{tensor.device}"
+                    )
+                plan = _TensorWritePlan(
+                    placeholder_index=len(tensor_plans),
+                    tensor=tensor,
+                    dtype_str=str(tensor.dtype),
+                    shape=tuple(int(v) for v in tensor.shape),
+                    numel=int(tensor.numel()),
+                    nbytes=int(tensor.numel() * tensor.element_size()),
+                    offset=next_offset,
+                    storage_device=tensor.device.type,
+                )
+                next_offset += plan.nbytes
+                tensor_plans.append(plan)
+                return {
+                    "__egm_tensor__": True,
+                    "index": plan.placeholder_index,
+                    "dtype": plan.dtype_str,
+                    "shape": plan.shape,
+                    "numel": plan.numel,
+                    "nbytes": plan.nbytes,
+                    "offset": plan.offset,
+                    "storage_device": plan.storage_device,
+                }
+            if isinstance(obj, dict):
+                return {k: _encode(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_encode(v) for v in obj]
+            if isinstance(obj, tuple):
+                return tuple(_encode(v) for v in obj)
+            return obj
+
+        metadata_obj = _encode(state_dict)
+        metadata_bytes = pickle.dumps(metadata_obj, protocol=pickle.HIGHEST_PROTOCOL)
+        return metadata_bytes, tensor_plans, next_offset
+
+    def _write_structured_slot_data_internal(
+        self,
+        local_slot: Optional[int],
+        *,
+        header: bytes,
+        metadata_bytes: bytes,
+        tensor_plans: List[_TensorWritePlan],
+        iteration: int,
+        bytes_after_header: int,
+        trailer_bytes: bytes,
+    ) -> tuple[Optional[int], Optional[Dict[str, Any]]]:
+        pid = self.local_rank
+        if local_slot is None or local_slot < 0 or local_slot >= self.config.num_slots:
+            local_slot = self._current_write_slot
+        backend_slot_id = self._backend_slot_ids[local_slot]
+
+        def _get_base_ptr() -> Optional[int]:
+            if self._egm_manager is not None:
+                return int(self._egm_manager.slots[backend_slot_id].va_addr)
+            if self._egm_client is not None:
+                mapping = self._imported_slot_mappings[local_slot]
+                if mapping is not None:
+                    return int(mapping.va_addr)
+            return None
+
+        base_ptr = _get_base_ptr()
+        if base_ptr is None:
+            return None, None
+
+        cpu_copy_seconds = 0.0
+        cpu_copy_bytes = 0
+        gpu_copy_seconds = 0.0
+        gpu_copy_bytes = 0
+
+        if self._egm_manager is not None:
+            manager_slot = self._egm_manager.slots[backend_slot_id]
+            manager_slot.force_release()
+            if not manager_slot.acquire(pid):
+                return None, None
+            if not manager_slot.begin_write(pid):
+                return None, None
+        elif self._egm_client is not None:
+            self._egm_client.release_slot(backend_slot_id, pid)
+            acquire_resp = self._egm_client.acquire_specific_slot(backend_slot_id, pid)
+            if acquire_resp.get("status") != "ok":
+                return None, None
+            begin_resp = self._egm_client.begin_write(backend_slot_id, pid)
+            if begin_resp.get("status") != "ok":
+                return None, None
+
+        meta_start = time.perf_counter()
+        ctypes.memmove(base_ptr, header, len(header))
+        if metadata_bytes:
+            ctypes.memmove(base_ptr + _HEADER_SIZE, metadata_bytes, len(metadata_bytes))
+        meta_end = time.perf_counter()
+        cpu_copy_seconds += meta_end - meta_start
+        cpu_copy_bytes += len(header) + len(metadata_bytes)
+
+        payload_base = base_ptr + _HEADER_SIZE + len(metadata_bytes)
+        gpu_copy_begin = time.perf_counter()
+        for plan in tensor_plans:
+            dst_ptr = payload_base + plan.offset
+            if plan.nbytes == 0:
+                continue
+            if plan.tensor.device.type == "cuda":
+                err = cuda_driver.cuMemcpyDtoDAsync(
+                    dst_ptr,
+                    int(plan.tensor.data_ptr()),
+                    plan.nbytes,
+                    0,
+                )
+                if not _cuda_call_succeeded(err):
+                    raise RuntimeError(f"cuMemcpyDtoDAsync failed: {err}")
+                gpu_copy_bytes += plan.nbytes
+            else:
+                cpu_start = time.perf_counter()
+                ctypes.memmove(dst_ptr, int(plan.tensor.data_ptr()), plan.nbytes)
+                cpu_end = time.perf_counter()
+                cpu_copy_seconds += cpu_end - cpu_start
+                cpu_copy_bytes += plan.nbytes
+        if gpu_copy_bytes > 0:
+            torch.cuda.synchronize(device=self.device_id)
+        gpu_copy_end = time.perf_counter()
+        if gpu_copy_bytes > 0:
+            gpu_copy_seconds += gpu_copy_end - gpu_copy_begin
+
+        checksum_hex = trailer_bytes.hex()
+        total_bytes = _HEADER_SIZE + bytes_after_header
+        if self._egm_manager is not None:
+            manager_slot = self._egm_manager.slots[backend_slot_id]
+            manager_slot.iteration = iteration
+            manager_slot.data_size = bytes_after_header
+            manager_slot.total_bytes = total_bytes
+            manager_slot.source_rank = self.rank
+            manager_slot.checksum_hex = checksum_hex
+            if not manager_slot.commit(pid):
+                return None, None
+        elif self._egm_client is not None:
+            meta_resp = self._egm_client.update_slot_metadata(
+                backend_slot_id,
+                iteration=iteration,
+                data_size=bytes_after_header,
+                total_bytes=total_bytes,
+                source_rank=self.rank,
+                checksum_hex=checksum_hex,
+                pid=pid,
+            )
+            if meta_resp.get("status") != "ok":
+                return None, None
+            commit_resp = self._egm_client.commit_slot(backend_slot_id, pid)
+            if commit_resp.get("status") != "ok":
+                return None, None
+
+        self._slot_metadata[local_slot] = _SlotMetadata(
+            status=_SLOT_STATUS_VALID,
+            iteration=iteration,
+            data_size=bytes_after_header,
+            timestamp=time.time(),
+            source_rank=self.rank,
+        )
+        self._current_write_slot = (local_slot + 1) % self.config.num_slots
+
+        return (
+            local_slot,
+            {
+                "direct_copy_seconds": gpu_copy_seconds if gpu_copy_bytes > 0 else cpu_copy_seconds,
+                "direct_copy_bw_gib_s": (
+                    (gpu_copy_bytes / (1024 ** 3)) / gpu_copy_seconds
+                    if gpu_copy_seconds > 0 and gpu_copy_bytes > 0
+                    else (
+                        (cpu_copy_bytes / (1024 ** 3)) / cpu_copy_seconds
+                        if cpu_copy_seconds > 0 and cpu_copy_bytes > 0
+                        else 0.0
+                    )
+                ),
+                "direct_copy_bytes": gpu_copy_bytes if gpu_copy_bytes > 0 else cpu_copy_bytes,
+                "direct_copy_path": (
+                    "structured_cuda_tensor_direct_to_egm"
+                    if gpu_copy_bytes > 0
+                    else "structured_cpu_memcpy_to_egm"
+                ),
+                "gpu_tensor_bytes": gpu_copy_bytes,
+                "gpu_copy_seconds": gpu_copy_seconds,
+                "gpu_copy_bw_gib_s": (
+                    (gpu_copy_bytes / (1024 ** 3)) / gpu_copy_seconds
+                    if gpu_copy_seconds > 0 and gpu_copy_bytes > 0
+                    else 0.0
+                ),
+                "cpu_tensor_bytes": cpu_copy_bytes,
+                "cpu_copy_seconds": cpu_copy_seconds,
+                "cpu_copy_bw_gib_s": (
+                    (cpu_copy_bytes / (1024 ** 3)) / cpu_copy_seconds
+                    if cpu_copy_seconds > 0 and cpu_copy_bytes > 0
+                    else 0.0
+                ),
+            },
+        )
+
+    def _deserialize_structured_payload(
+        self, payload: bytes, trailer_bytes: bytes
+    ) -> Dict[str, Any]:
+        metadata_size, _, _, _ = struct.unpack(
+            _STRUCTURED_TRAILER_FORMAT,
+            trailer_bytes[:_STRUCTURED_TRAILER_SIZE],
+        )
+        metadata_size = int(metadata_size)
+        metadata_blob = payload[:metadata_size]
+        metadata_obj = pickle.loads(metadata_blob)
+        payload_base_offset = metadata_size
+
+        py_bytes_as_string = ctypes.pythonapi.PyBytes_AsString
+        py_bytes_as_string.restype = ctypes.c_void_p
+        py_bytes_as_string.argtypes = [ctypes.py_object]
+        payload_ptr = int(py_bytes_as_string(payload))
+
+        def _decode(obj: Any) -> Any:
+            if isinstance(obj, dict) and obj.get("__egm_tensor__") is True:
+                dtype = _dtype_from_string(str(obj["dtype"]))
+                numel = int(obj["numel"])
+                nbytes = int(obj["nbytes"])
+                shape = tuple(int(v) for v in obj["shape"])
+                offset = int(obj["offset"])
+                tensor = torch.empty(numel, dtype=dtype, device="cpu")
+                if nbytes > 0:
+                    ctypes.memmove(
+                        int(tensor.data_ptr()),
+                        payload_ptr + payload_base_offset + offset,
+                        nbytes,
+                    )
+                return tensor.view(shape)
+            if isinstance(obj, dict):
+                return {k: _decode(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_decode(v) for v in obj]
+            if isinstance(obj, tuple):
+                return tuple(_decode(v) for v in obj)
+            return obj
+
+        decoded = _decode(metadata_obj)
+        assert isinstance(decoded, dict), type(decoded)
+        return decoded
 
     def _resolve_restore_source_rank(self) -> int:
         if self._explicit_restore_source_rank is not None:
@@ -588,19 +953,20 @@ class EGMCheckpointManager:
         checksum_hex = ""
 
         if len(data) >= _HEADER_SIZE:
-            magic, _, iter_val, data_size, reserved, checksum = _parse_header(
+            magic, version, iter_val, data_size, reserved, trailer = _parse_header(
                 data[:_HEADER_SIZE]
             )
             if magic == _HEADER_MAGIC:
-                payload = data[_HEADER_SIZE:_HEADER_SIZE + data_size]
-                actual_checksum = _compute_checksum(payload)
-                if actual_checksum != checksum:
-                    logger.error("[MCORE][EGM] checksum mismatch while writing raw slot data")
-                    return None, None
+                if version == _HEADER_VERSION_LEGACY:
+                    payload = data[_HEADER_SIZE:_HEADER_SIZE + data_size]
+                    actual_checksum = _compute_checksum(payload)
+                    if actual_checksum != trailer:
+                        logger.error("[MCORE][EGM] checksum mismatch while writing raw slot data")
+                        return None, None
                 parsed_iteration = int(iter_val)
                 parsed_data_size = int(data_size)
                 source_rank = int(reserved)
-                checksum_hex = checksum.hex()
+                checksum_hex = trailer.hex()
 
         pid = self.local_rank
         if local_slot is None or local_slot < 0 or local_slot >= self.config.num_slots:
@@ -770,7 +1136,7 @@ def _build_header(
     struct_part = struct.pack(
         _HEADER_STRUCT_FORMAT,
         _HEADER_MAGIC,
-        _HEADER_VERSION,
+        _HEADER_VERSION_LEGACY,
         iteration,
         data_size,
         source_rank,
@@ -778,13 +1144,65 @@ def _build_header(
     return struct_part + checksum
 
 
+def _build_structured_header(
+    iteration: int,
+    data_size: int,
+    source_rank: int,
+    metadata_size: int,
+    tensor_data_bytes: int,
+    tensor_count: int,
+) -> bytes:
+    struct_part = struct.pack(
+        _HEADER_STRUCT_FORMAT,
+        _HEADER_MAGIC,
+        _HEADER_VERSION_STRUCTURED,
+        iteration,
+        data_size,
+        source_rank,
+    )
+    trailer = struct.pack(
+        _STRUCTURED_TRAILER_FORMAT,
+        metadata_size,
+        tensor_data_bytes,
+        tensor_count,
+        0,
+    )
+    return struct_part + trailer
+
+
 def _parse_header(header_bytes: bytes):
     struct_part = header_bytes[:_HEADER_STRUCT_SIZE]
-    checksum = header_bytes[_HEADER_STRUCT_SIZE:_HEADER_STRUCT_SIZE + _CHECKSUM_SIZE]
+    trailer = header_bytes[_HEADER_STRUCT_SIZE:_HEADER_STRUCT_SIZE + _CHECKSUM_SIZE]
     magic, version, iteration, data_size, reserved = struct.unpack(
         _HEADER_STRUCT_FORMAT, struct_part
     )
-    return magic, version, iteration, data_size, reserved, checksum
+    return magic, version, iteration, data_size, reserved, trailer
+
+
+def _dtype_from_string(dtype_str: str) -> torch.dtype:
+    mapping = {
+        "torch.float64": torch.float64,
+        "torch.float32": torch.float32,
+        "torch.float16": torch.float16,
+        "torch.bfloat16": torch.bfloat16,
+        "torch.int64": torch.int64,
+        "torch.int32": torch.int32,
+        "torch.int16": torch.int16,
+        "torch.int8": torch.int8,
+        "torch.uint8": torch.uint8,
+        "torch.bool": torch.bool,
+    }
+    if dtype_str not in mapping:
+        raise RuntimeError(f"Unsupported dtype in structured EGM checkpoint: {dtype_str}")
+    return mapping[dtype_str]
+
+
+def _cuda_call_succeeded(err: Any) -> bool:
+    if isinstance(err, tuple):
+        if len(err) == 0:
+            return False
+        err = err[0]
+    return err == cuda_driver.CUresult.CUDA_SUCCESS
 
 
 def intra_rack_ring_backup(manager: EGMCheckpointManager, raw_data: bytes) -> bool:
