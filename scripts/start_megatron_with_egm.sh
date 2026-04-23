@@ -192,6 +192,24 @@ topology = json.loads(sys.argv[1])
 print(json.dumps({str(d["local_rank"]): int(d["numa"]) for d in topology["devices"]}))
 PY
     )"
+    export FT_EGM_LOCAL_RANK_GROUP_INDEX_MAP="$(
+        python3 - <<'PY' "${TOPOLOGY_JSON}"
+import json
+import sys
+topology = json.loads(sys.argv[1])
+devices = topology["devices"]
+groups = {}
+for d in devices:
+    groups.setdefault(int(d["numa"]), []).append(d)
+for group in groups.values():
+    group.sort(key=lambda x: int(x["local_rank"]))
+result = {}
+for _, group in sorted(groups.items()):
+    for idx, d in enumerate(group):
+        result[str(d["local_rank"])] = idx
+print(json.dumps(result))
+PY
+    )"
 
     while IFS=$'\t' read -r daemon_numa daemon_device daemon_count daemon_slots daemon_socket; do
         [[ -z "${daemon_socket}" ]] && continue

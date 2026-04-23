@@ -100,12 +100,18 @@ class EGMCheckpointManager:
         rank: int = 0,
         local_rank: int = 0,
         world_size: int = 1,
+        backend_group_local_rank: Optional[int] = None,
     ):
         self.config = config
         self.device_id = device_id
         self.rank = rank
         self.local_rank = local_rank
         self.world_size = world_size
+        self.backend_group_local_rank = (
+            int(backend_group_local_rank)
+            if backend_group_local_rank is not None
+            else int(local_rank)
+        )
 
         self._egm_manager = None
         self._egm_client = None
@@ -177,14 +183,14 @@ class EGMCheckpointManager:
 
         all_slots = self._egm_client.get_all_slots()
         total_slots = len(all_slots.get("slots", [])) if all_slots.get("status") == "ok" else 0
-        required_slots = (self.local_rank + 1) * self.config.num_slots
+        required_slots = (self.backend_group_local_rank + 1) * self.config.num_slots
         if total_slots < required_slots:
             raise RuntimeError(
                 "EGM daemon does not have enough slots for per-rank isolation: "
                 f"need at least {required_slots}, got {total_slots}. "
                 "Start the daemon with num_slots >= local_world_size * egm_num_slots."
             )
-        slot_base = self.local_rank * self.config.num_slots
+        slot_base = self.backend_group_local_rank * self.config.num_slots
         self._backend_slot_ids = list(range(slot_base, slot_base + self.config.num_slots))
 
         for i in range(self.config.num_slots):
@@ -199,6 +205,7 @@ class EGMCheckpointManager:
             f"{self.config.daemon_socket_path}, "
             f"{self.config.num_slots} local staging buffers, "
             f"global_rank={self.rank}, local_rank={self.local_rank}, "
+            f"backend_group_local_rank={self.backend_group_local_rank}, "
             f"backend_slots={self._backend_slot_ids}"
         )
 

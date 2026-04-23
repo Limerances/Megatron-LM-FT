@@ -156,18 +156,25 @@ def _resolve_egm_topology(
     rank: int,
     local_rank: int,
     device_id: int,
-) -> tuple[str, int]:
+) -> tuple[str, int, int]:
     auto_topology = os.environ.get("FT_EGM_AUTO_TOPOLOGY", "0") == "1"
     local_rank_socket_map = os.environ.get("FT_EGM_LOCAL_RANK_SOCKET_MAP")
     local_rank_numa_map = os.environ.get("FT_EGM_LOCAL_RANK_NUMA_MAP")
+    local_rank_group_index_map = os.environ.get("FT_EGM_LOCAL_RANK_GROUP_INDEX_MAP")
     if auto_topology and local_rank_socket_map and local_rank_numa_map:
         try:
             socket_map = json.loads(local_rank_socket_map)
             numa_map = json.loads(local_rank_numa_map)
+            group_index_map = (
+                json.loads(local_rank_group_index_map)
+                if local_rank_group_index_map
+                else {}
+            )
             mapped_socket = socket_map.get(str(local_rank))
             mapped_numa = numa_map.get(str(local_rank))
+            mapped_group_index = group_index_map.get(str(local_rank), 0)
             if mapped_socket is not None and mapped_numa is not None:
-                return str(mapped_socket), int(mapped_numa)
+                return str(mapped_socket), int(mapped_numa), int(mapped_group_index)
         except Exception as e:
             logger.warning(
                 f"EGM: failed to parse local-rank topology mapping; "
@@ -199,7 +206,7 @@ def _resolve_egm_topology(
             numa=resolved_numa,
         )
 
-    return resolved_socket_path, resolved_numa
+    return resolved_socket_path, resolved_numa, local_rank
 
 
 def setup(args) -> None:
@@ -236,7 +243,7 @@ def setup(args) -> None:
         local_rank = int(os.environ.get("LOCAL_RANK", rank))
     device_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
 
-    daemon_socket_path, numa_node_id = _resolve_egm_topology(
+    daemon_socket_path, numa_node_id, backend_group_local_rank = _resolve_egm_topology(
         daemon_socket_path=daemon_socket_path,
         numa_node_id=numa_node_id,
         rank=rank,
@@ -252,6 +259,7 @@ def setup(args) -> None:
         rank=rank,
         local_rank=local_rank,
         world_size=world_size,
+        backend_group_local_rank=backend_group_local_rank,
     )
     manager.initialize()
 
@@ -259,7 +267,8 @@ def setup(args) -> None:
         print_rank_0(
             f"EGM: initialized in DAEMON mode, connected to {daemon_socket_path}. "
             f"Checkpoint memory is held by external daemon — survives training crashes. "
-            f"(device={device_id}, local_rank={local_rank}, numa={numa_node_id})"
+            f"(device={device_id}, local_rank={local_rank}, "
+            f"backend_group_local_rank={backend_group_local_rank}, numa={numa_node_id})"
         )
     else:
         print_rank_0(
