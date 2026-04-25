@@ -430,6 +430,24 @@ class EGMManager:
                 return result
         return False
 
+    def force_release_slot(self, slot_id: int) -> bool:
+        """Force release a slot, bypassing the owner_pid ownership check.
+
+        This is required after a training-process crash to reclaim slots that
+        are still held by a defunct pid (which the new training process cannot
+        match). Committed payload bytes in the mapped EGM VA range are NOT
+        zeroed out, so recovery readers can still consult
+        get_active_slot()/get_all_slots_info() metadata before this call.
+        """
+        with self._lock:
+            if 0 <= slot_id < len(self._slots):
+                self._slots[slot_id].force_release()
+                logger.info(
+                    f"[MCORE][EGM] Slot {slot_id} force-released"
+                )
+                return True
+        return False
+
     def begin_write(self, slot_id: int, pid: int) -> bool:
         """Mark a slot as being written to."""
         if 0 <= slot_id < len(self._slots):
@@ -613,6 +631,7 @@ class _IPCRequestType(Enum):
     ACQUIRE_SLOT = "acquire_slot"
     ACQUIRE_SPECIFIC_SLOT = "acquire_specific_slot"
     RELEASE_SLOT = "release_slot"
+    FORCE_RELEASE_SLOT = "force_release_slot"
     BEGIN_WRITE = "begin_write"
     COMMIT_SLOT = "commit_slot"
     GET_SLOT_INFO = "get_slot_info"
@@ -785,6 +804,11 @@ class EGMManagerServer:
         if req_type == _IPCRequestType.RELEASE_SLOT.value:
             slot_id = request.get("slot_id", -1)
             result = self._manager.release_slot(slot_id, pid)
+            return {"status": "ok" if result else "error", "released": result}
+
+        if req_type == _IPCRequestType.FORCE_RELEASE_SLOT.value:
+            slot_id = request.get("slot_id", -1)
+            result = self._manager.force_release_slot(slot_id)
             return {"status": "ok" if result else "error", "released": result}
 
         if req_type == _IPCRequestType.BEGIN_WRITE.value:
@@ -981,6 +1005,18 @@ class EGMClient:
             "type": _IPCRequestType.RELEASE_SLOT.value,
             "slot_id": slot_id,
             "pid": pid,
+        })
+
+    def force_release_slot(self, slot_id: int) -> Dict[str, Any]:
+        """Force-release a slot regardless of previous owner_pid.
+
+        Used by a newly started training process to reclaim slots that were
+        held by a crashed pid, without zeroing the committed EGM bytes so
+        the new process can still consult committed metadata first.
+        """
+        return self._request({
+            "type": _IPCRequestType.FORCE_RELEASE_SLOT.value,
+            "slot_id": slot_id,
         })
 
     def begin_write(self, slot_id: int, pid: Optional[int] = None) -> Dict[str, Any]:

@@ -126,6 +126,12 @@ class EGMCheckpointManager:
         self._last_load_stats: Optional[Dict[str, Any]] = None
         self._lock = threading.Lock()
         self._initialized = False
+        # Dedicated high-priority CUDA stream used for DtoD copies into the EGM
+        # VA range. Keeping EGM copies off the default (NULL) stream avoids
+        # implicit global synchronization with compute/collective streams that
+        # was previously serializing launches of the 5000+ per-tensor copies.
+        self._copy_stream: Optional[torch.cuda.Stream] = None
+        self._copy_stream_handle: int = 0
 
     def initialize(self) -> None:
         if self._initialized:
@@ -140,7 +146,37 @@ class EGMCheckpointManager:
         else:
             self._init_inprocess_mode(pool_size_bytes, slot_size)
 
+        self._init_copy_stream()
+
         self._initialized = True
+
+    def _init_copy_stream(self) -> None:
+        """Create a dedicated CUDA stream for EGM DtoD copies.
+
+        Using a non-default stream avoids the implicit global sync that the
+        NULL stream forces on every launch, which was serializing the 5000+
+        per-tensor cuMemcpyDtoDAsync launches with other compute streams and
+        with each other. A high-priority stream lets the DMA engine process
+        the copy queue without waiting on unrelated compute kernels.
+        """
+        try:
+            if not torch.cuda.is_available():
+                return
+            device = torch.device("cuda", self.device_id)
+            try:
+                low_pri, high_pri = torch.cuda.Stream.priority_range()
+                priority = high_pri
+            except Exception:
+                priority = 0
+            self._copy_stream = torch.cuda.Stream(device=device, priority=priority)
+            self._copy_stream_handle = int(self._copy_stream.cuda_stream)
+        except Exception as e:
+            logger.warning(
+                f"[MCORE][EGM] Failed to create dedicated EGM copy stream, "
+                f"falling back to default stream: {e}"
+            )
+            self._copy_stream = None
+            self._copy_stream_handle = 0
 
     def _init_inprocess_mode(self, pool_size_bytes: int, slot_size: int) -> None:
         from megatron.core.egm.egm_manager import EGMConfig, EGMManager
@@ -673,10 +709,21 @@ class EGMCheckpointManager:
             if not manager_slot.begin_write(pid):
                 return None, None
         elif self._egm_client is not None:
-            self._egm_client.release_slot(backend_slot_id, pid)
+            release_resp = self._egm_client.release_slot(backend_slot_id, pid)
+            if release_resp.get("status") != "ok":
+                # Previous owner (e.g., crashed pid / remapped rank) may still
+                # hold the slot. Force-release so the new process can acquire it
+                # without waiting for a timeout. Committed payload bytes remain
+                # in the mapped EGM VA, so restore reads are unaffected.
+                self._egm_client.force_release_slot(backend_slot_id)
             acquire_resp = self._egm_client.acquire_specific_slot(backend_slot_id, pid)
             if acquire_resp.get("status") != "ok":
-                return None, None
+                # One more reclaim attempt, in case the slot state changed
+                # between the release and the acquire.
+                self._egm_client.force_release_slot(backend_slot_id)
+                acquire_resp = self._egm_client.acquire_specific_slot(backend_slot_id, pid)
+                if acquire_resp.get("status") != "ok":
+                    return None, None
             begin_resp = self._egm_client.begin_write(backend_slot_id, pid)
             if begin_resp.get("status") != "ok":
                 return None, None
@@ -691,6 +738,17 @@ class EGMCheckpointManager:
 
         payload_base = base_ptr + _HEADER_SIZE + len(metadata_bytes)
         gpu_copy_begin = time.perf_counter()
+        copy_stream_handle = self._copy_stream_handle
+        # Make the dedicated copy stream wait for any pending writes to the
+        # source tensors on PyTorch's current compute stream. Without this,
+        # DtoD copies issued on the copy stream could race with unfinished
+        # parameter/optimizer updates still outstanding on the compute stream.
+        if self._copy_stream is not None:
+            try:
+                current_stream = torch.cuda.current_stream(device=self.device_id)
+                self._copy_stream.wait_stream(current_stream)
+            except Exception:
+                pass
         for plan in tensor_plans:
             dst_ptr = payload_base + plan.offset
             if plan.nbytes == 0:
@@ -700,7 +758,7 @@ class EGMCheckpointManager:
                     dst_ptr,
                     int(plan.tensor.data_ptr()),
                     plan.nbytes,
-                    0,
+                    copy_stream_handle,
                 )
                 if not _cuda_call_succeeded(err):
                     raise RuntimeError(f"cuMemcpyDtoDAsync failed: {err}")
@@ -712,7 +770,10 @@ class EGMCheckpointManager:
                 cpu_copy_seconds += cpu_end - cpu_start
                 cpu_copy_bytes += plan.nbytes
         if gpu_copy_bytes > 0:
-            torch.cuda.synchronize(device=self.device_id)
+            if self._copy_stream is not None:
+                self._copy_stream.synchronize()
+            else:
+                torch.cuda.synchronize(device=self.device_id)
         gpu_copy_end = time.perf_counter()
         if gpu_copy_bytes > 0:
             gpu_copy_seconds += gpu_copy_end - gpu_copy_begin
@@ -850,7 +911,7 @@ class EGMCheckpointManager:
                             int(tensor.data_ptr()),
                             tensor_data_base_ptr + offset,
                             nbytes,
-                            0,
+                            self._copy_stream_handle,
                         )
                         if not _cuda_call_succeeded(err):
                             raise RuntimeError(f"cuMemcpyDtoDAsync failed while loading: {err}")
@@ -877,7 +938,18 @@ class EGMCheckpointManager:
         decoded = _decode(metadata_obj)
         gpu_copy_seconds = 0.0
         if gpu_copy_bytes > 0:
-            torch.cuda.synchronize(device=self.device_id)
+            if self._copy_stream is not None:
+                # Ensure subsequent compute stream usage sees the loaded
+                # tensor contents without requiring the caller to manually
+                # synchronize.
+                try:
+                    current_stream = torch.cuda.current_stream(device=self.device_id)
+                    current_stream.wait_stream(self._copy_stream)
+                except Exception:
+                    pass
+                self._copy_stream.synchronize()
+            else:
+                torch.cuda.synchronize(device=self.device_id)
             gpu_copy_end = time.perf_counter()
             gpu_copy_seconds = gpu_copy_end - gpu_copy_begin
         assert isinstance(decoded, dict), type(decoded)
@@ -1176,10 +1248,21 @@ class EGMCheckpointManager:
             if not manager_slot.commit(pid):
                 return None, None
         elif self._egm_client is not None:
-            self._egm_client.release_slot(backend_slot_id, pid)
+            release_resp = self._egm_client.release_slot(backend_slot_id, pid)
+            if release_resp.get("status") != "ok":
+                # Previous owner (e.g., crashed pid / remapped rank) may still
+                # hold the slot. Force-release so the new process can acquire it
+                # without waiting for a timeout. Committed payload bytes remain
+                # in the mapped EGM VA, so restore reads are unaffected.
+                self._egm_client.force_release_slot(backend_slot_id)
             acquire_resp = self._egm_client.acquire_specific_slot(backend_slot_id, pid)
             if acquire_resp.get("status") != "ok":
-                return None, None
+                # One more reclaim attempt, in case the slot state changed
+                # between the release and the acquire.
+                self._egm_client.force_release_slot(backend_slot_id)
+                acquire_resp = self._egm_client.acquire_specific_slot(backend_slot_id, pid)
+                if acquire_resp.get("status") != "ok":
+                    return None, None
             begin_resp = self._egm_client.begin_write(backend_slot_id, pid)
             if begin_resp.get("status") != "ok":
                 return None, None
