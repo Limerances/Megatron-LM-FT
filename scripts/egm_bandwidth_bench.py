@@ -96,7 +96,12 @@ def _align_up(x: int, a: int) -> int:
 
 
 def _create_stream(cuda_driver: Any) -> Any:
-    err, stream = cuda_driver.cuStreamCreate(0)
+    # Use CU_STREAM_NON_BLOCKING (0x1) so streams do NOT implicitly synchronize
+    # with the legacy default (NULL) stream. This is required for the
+    # multi-stream DtoD fan-out path to actually let concurrent launches map to
+    # different copy engines; the default flag=0 produces a "blocking" stream
+    # that would serialize on the NULL stream.
+    err, stream = cuda_driver.cuStreamCreate(0x1)
     _check(err, cuda_driver, "cuStreamCreate failed")
     return stream
 
@@ -209,6 +214,69 @@ def _bench_copy(
         err = cuda_driver.cuMemcpyDtoDAsync(dst, src, nbytes, stream)
         _check(err, cuda_driver, "cuMemcpyDtoDAsync failed")
     _check(cuda_driver.cuEventRecord(end, stream), cuda_driver, "cuEventRecord(end) failed")
+    _check(cuda_driver.cuEventSynchronize(end), cuda_driver, "cuEventSynchronize failed")
+    ms = _event_elapsed_ms(cuda_driver, start, end)
+    return ms / 1000.0
+
+
+def _bench_copy_multi_stream(
+    cuda_driver: Any,
+    *,
+    streams: list,
+    timing_stream: Any,
+    src: int,
+    dst: int,
+    nbytes: int,
+    iters: int,
+    warmup: int,
+) -> float:
+    """Benchmark a DtoD copy that is fanned across multiple streams.
+
+    The buffer of ``nbytes`` is split into ``len(streams)`` equal shards,
+    each shard is issued on its own stream so the driver can use separate
+    copy engines concurrently. We time across a common stream by recording
+    an event on each worker stream and making the timing stream wait on all
+    of them, so the elapsed time reflects the makespan of the slowest
+    engine, i.e. the achievable aggregate per-GPU bandwidth.
+    """
+    assert len(streams) >= 1
+    n = len(streams)
+    # 128-byte aligned shards; tail shard absorbs the remainder.
+    shard = max(128, (nbytes // n) & ~127)
+
+    def _issue_once() -> None:
+        offset = 0
+        for i, s in enumerate(streams):
+            this_nbytes = shard if i < n - 1 else (nbytes - offset)
+            if this_nbytes <= 0:
+                continue
+            err = cuda_driver.cuMemcpyDtoDAsync(dst + offset, src + offset, this_nbytes, s)
+            _check(err, cuda_driver, "cuMemcpyDtoDAsync failed (multi-stream)")
+            offset += this_nbytes
+
+    # Warmup
+    for _ in range(max(0, warmup)):
+        _issue_once()
+    for s in streams:
+        _check(cuda_driver.cuStreamSynchronize(s), cuda_driver, "cuStreamSynchronize failed (warmup)")
+
+    start = _create_event(cuda_driver)
+    end = _create_event(cuda_driver)
+    _check(cuda_driver.cuEventRecord(start, timing_stream), cuda_driver, "cuEventRecord(start) failed")
+    # Fan-out: make worker streams wait on the timing stream's start.
+    for s in streams:
+        _check(cuda_driver.cuStreamWaitEvent(s, start, 0), cuda_driver, "cuStreamWaitEvent(start) failed")
+    for _ in range(iters):
+        _issue_once()
+    # Fan-in: per-worker events joined into the timing stream.
+    per_stream_events = []
+    for s in streams:
+        ev = _create_event(cuda_driver)
+        _check(cuda_driver.cuEventRecord(ev, s), cuda_driver, "cuEventRecord(worker) failed")
+        per_stream_events.append(ev)
+    for ev in per_stream_events:
+        _check(cuda_driver.cuStreamWaitEvent(timing_stream, ev, 0), cuda_driver, "cuStreamWaitEvent(join) failed")
+    _check(cuda_driver.cuEventRecord(end, timing_stream), cuda_driver, "cuEventRecord(end) failed")
     _check(cuda_driver.cuEventSynchronize(end), cuda_driver, "cuEventSynchronize failed")
     ms = _event_elapsed_ms(cuda_driver, start, end)
     return ms / 1000.0
@@ -355,6 +423,7 @@ def _run_single_device_bench(
     warmup: int,
     direction: str,
     modes: list[str],
+    streams: int = 1,
     start_event: Optional[Any] = None,
     ready_queue: Optional[Any] = None,
 ) -> list[dict[str, Any]]:
@@ -371,6 +440,14 @@ def _run_single_device_bench(
     _check(err, cuda_driver, "cuCtxSetCurrent failed")
 
     stream = _create_stream(cuda_driver)
+    extra_streams: list[Any] = []
+    n_multi_streams = max(1, int(streams))
+    if n_multi_streams > 1:
+        # Allocate extra streams for the multi-stream fan-out path. Note these
+        # are non-blocking streams (see _create_stream) so they do not
+        # synchronize with the NULL stream.
+        for _ in range(n_multi_streams):
+            extra_streams.append(_create_stream(cuda_driver))
     mem_handle: Optional[Any] = None
     egm_va = 0
     egm_size = 0
@@ -427,6 +504,18 @@ def _run_single_device_bench(
                     warmup=int(warmup),
                 )
                 _append_result("GPU->EGM (write)", t)
+                if n_multi_streams > 1:
+                    t_ms = _bench_copy_multi_stream(
+                        cuda_driver,
+                        streams=extra_streams,
+                        timing_stream=stream,
+                        src=d_a,
+                        dst=egm_va,
+                        nbytes=size_bytes,
+                        iters=int(iters),
+                        warmup=int(warmup),
+                    )
+                    _append_result(f"GPU->EGM (write, x{n_multi_streams} streams)", t_ms)
 
             if direction in ("read", "both"):
                 t = _bench_copy(
@@ -439,6 +528,18 @@ def _run_single_device_bench(
                     warmup=int(warmup),
                 )
                 _append_result("EGM->GPU (read)", t)
+                if n_multi_streams > 1:
+                    t_ms = _bench_copy_multi_stream(
+                        cuda_driver,
+                        streams=extra_streams,
+                        timing_stream=stream,
+                        src=egm_va,
+                        dst=d_b,
+                        nbytes=size_bytes,
+                        iters=int(iters),
+                        warmup=int(warmup),
+                    )
+                    _append_result(f"EGM->GPU (read, x{n_multi_streams} streams)", t_ms)
 
         if "pinned" in modes:
             if direction in ("write", "both"):
@@ -519,6 +620,11 @@ def _run_single_device_bench(
         except Exception:
             pass
         try:
+            for s in extra_streams:
+                cuda_driver.cuStreamDestroy(s)
+        except Exception:
+            pass
+        try:
             cuda_driver.cuDevicePrimaryCtxRelease(dev)
         except Exception:
             pass
@@ -533,6 +639,7 @@ def _worker_entry(
     warmup: int,
     direction: str,
     modes: list[str],
+    streams: int,
     start_event: Any,
     ready_queue: Any,
     result_queue: Any,
@@ -547,6 +654,7 @@ def _worker_entry(
             warmup=warmup,
             direction=direction,
             modes=modes,
+            streams=streams,
             start_event=start_event,
             ready_queue=ready_queue,
         )
@@ -602,6 +710,18 @@ def main() -> int:
         help="Run selected devices sequentially instead of concurrently. Default is concurrent for multi-device selections.",
     )
     parser.add_argument(
+        "--streams",
+        type=int,
+        default=1,
+        help=(
+            "Number of concurrent CUDA streams per GPU to fan DtoD copies across. "
+            "A single cuMemcpyDtoDAsync on NULL/one stream uses one copy engine "
+            "and plateaus around ~180 GiB/s on GB200; using >=4 streams lets the "
+            "driver schedule multiple copy engines and approach the ~225 GB/s "
+            "C2C link limit per B200. Default 1 (legacy behaviour)."
+        ),
+    )
+    parser.add_argument(
         "--list-topology",
         action="store_true",
         help="Print device -> HOST_NUMA topology and exit.",
@@ -649,6 +769,7 @@ def main() -> int:
                 warmup=int(args.warmup),
                 direction=args.direction,
                 modes=modes,
+                streams=int(args.streams),
             )
             for result in results:
                 print(_format_result_line(result))
@@ -677,6 +798,7 @@ def main() -> int:
                     int(args.warmup),
                     args.direction,
                     modes,
+                    int(args.streams),
                     start_event,
                     ready_queue,
                     result_queue,

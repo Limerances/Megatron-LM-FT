@@ -126,12 +126,16 @@ class EGMCheckpointManager:
         self._last_load_stats: Optional[Dict[str, Any]] = None
         self._lock = threading.Lock()
         self._initialized = False
-        # Dedicated high-priority CUDA stream used for DtoD copies into the EGM
-        # VA range. Keeping EGM copies off the default (NULL) stream avoids
-        # implicit global synchronization with compute/collective streams that
-        # was previously serializing launches of the 5000+ per-tensor copies.
-        self._copy_stream: Optional[torch.cuda.Stream] = None
-        self._copy_stream_handle: int = 0
+        # Dedicated high-priority CUDA streams used for DtoD copies into the
+        # EGM VA range. We allocate MULTIPLE streams so the Blackwell GPU can
+        # dispatch concurrent cuMemcpyDtoDAsync to several independent copy
+        # engines at once: a single CE plateaus around ~180 GiB/s on GB200
+        # while the NVLink-C2C link up-bound is 225 GB/s per B200, so without
+        # multi-CE parallelism we lose ~20% of the C2C bandwidth. The NULL
+        # stream (stream=0) would additionally serialize all ~5000 launches
+        # against each other and against any unrelated compute/NCCL streams.
+        self._copy_streams: List["torch.cuda.Stream"] = []
+        self._copy_stream_handles: List[int] = []
 
     def initialize(self) -> None:
         if self._initialized:
@@ -151,14 +155,20 @@ class EGMCheckpointManager:
         self._initialized = True
 
     def _init_copy_stream(self) -> None:
-        """Create a dedicated CUDA stream for EGM DtoD copies.
+        """Create a set of dedicated CUDA streams for EGM DtoD copies.
 
-        Using a non-default stream avoids the implicit global sync that the
-        NULL stream forces on every launch, which was serializing the 5000+
-        per-tensor cuMemcpyDtoDAsync launches with other compute streams and
-        with each other. A high-priority stream lets the DMA engine process
-        the copy queue without waiting on unrelated compute kernels.
+        A single `cuMemcpyDtoDAsync` plateaus at roughly one B200 copy engine
+        worth of throughput (~180 GiB/s for GPU->EGM on GB200). The actual
+        NVLink-C2C single-direction upper bound per B200 is ~225 GB/s, so to
+        approach the link limit we fan the per-tensor launches across
+        multiple streams, which the driver maps onto distinct copy engines.
+
+        The number of streams is controlled by the ``EGM_COPY_STREAMS`` env
+        var (default 4, clamped to [1, 8]). Priority is high so that EGM DMA
+        work is not delayed behind unrelated low-priority compute.
         """
+        self._copy_streams = []
+        self._copy_stream_handles = []
         try:
             if not torch.cuda.is_available():
                 return
@@ -168,15 +178,26 @@ class EGMCheckpointManager:
                 priority = high_pri
             except Exception:
                 priority = 0
-            self._copy_stream = torch.cuda.Stream(device=device, priority=priority)
-            self._copy_stream_handle = int(self._copy_stream.cuda_stream)
+            try:
+                n_streams = int(os.environ.get("EGM_COPY_STREAMS", "4"))
+            except Exception:
+                n_streams = 4
+            n_streams = max(1, min(8, n_streams))
+            for _ in range(n_streams):
+                s = torch.cuda.Stream(device=device, priority=priority)
+                self._copy_streams.append(s)
+                self._copy_stream_handles.append(int(s.cuda_stream))
+            logger.info(
+                f"[MCORE][EGM] Initialized {n_streams} dedicated EGM copy "
+                f"stream(s) on device {self.device_id} (priority={priority})"
+            )
         except Exception as e:
             logger.warning(
-                f"[MCORE][EGM] Failed to create dedicated EGM copy stream, "
+                f"[MCORE][EGM] Failed to create dedicated EGM copy streams, "
                 f"falling back to default stream: {e}"
             )
-            self._copy_stream = None
-            self._copy_stream_handle = 0
+            self._copy_streams = []
+            self._copy_stream_handles = []
 
     def _init_inprocess_mode(self, pool_size_bytes: int, slot_size: int) -> None:
         from megatron.core.egm.egm_manager import EGMConfig, EGMManager
@@ -738,31 +759,67 @@ class EGMCheckpointManager:
 
         payload_base = base_ptr + _HEADER_SIZE + len(metadata_bytes)
         gpu_copy_begin = time.perf_counter()
-        copy_stream_handle = self._copy_stream_handle
-        # Make the dedicated copy stream wait for any pending writes to the
+        stream_handles = self._copy_stream_handles
+        use_multi_stream = len(stream_handles) > 0
+        num_streams = len(stream_handles) if use_multi_stream else 1
+        # Make every dedicated copy stream wait for any pending writes to the
         # source tensors on PyTorch's current compute stream. Without this,
-        # DtoD copies issued on the copy stream could race with unfinished
+        # DtoD copies issued on the copy streams could race with unfinished
         # parameter/optimizer updates still outstanding on the compute stream.
-        if self._copy_stream is not None:
+        if use_multi_stream:
             try:
                 current_stream = torch.cuda.current_stream(device=self.device_id)
-                self._copy_stream.wait_stream(current_stream)
+                for s in self._copy_streams:
+                    s.wait_stream(current_stream)
             except Exception:
                 pass
+        # Heuristic: tensors larger than this threshold get split across all
+        # copy streams so that even a single giant tensor can use multiple
+        # copy engines in parallel. Smaller tensors are round-robined across
+        # streams so many small launches still parallelize over CEs.
+        split_threshold = max(
+            4 * 1024 * 1024,  # 4 MiB minimum per-shard to keep CE utilization
+            int(os.environ.get("EGM_COPY_SPLIT_BYTES", 16 * 1024 * 1024)),
+        )
+        stream_rr = 0
         for plan in tensor_plans:
             dst_ptr = payload_base + plan.offset
             if plan.nbytes == 0:
                 continue
             if plan.tensor.device.type == "cuda":
-                err = cuda_driver.cuMemcpyDtoDAsync(
-                    dst_ptr,
-                    int(plan.tensor.data_ptr()),
-                    plan.nbytes,
-                    copy_stream_handle,
-                )
-                if not _cuda_call_succeeded(err):
-                    raise RuntimeError(f"cuMemcpyDtoDAsync failed: {err}")
-                gpu_copy_bytes += plan.nbytes
+                src_ptr = int(plan.tensor.data_ptr())
+                nbytes = plan.nbytes
+                if use_multi_stream and nbytes >= split_threshold and num_streams > 1:
+                    # Split a single large tensor across all copy streams.
+                    # Chunks are aligned to 128 B so CE can still use wide
+                    # bursts; the tail chunk absorbs any remainder.
+                    shard = max(128, (nbytes // num_streams) & ~127)
+                    offset = 0
+                    for i in range(num_streams):
+                        this_nbytes = shard if i < num_streams - 1 else (nbytes - offset)
+                        if this_nbytes <= 0:
+                            continue
+                        err = cuda_driver.cuMemcpyDtoDAsync(
+                            dst_ptr + offset,
+                            src_ptr + offset,
+                            this_nbytes,
+                            stream_handles[i],
+                        )
+                        if not _cuda_call_succeeded(err):
+                            raise RuntimeError(f"cuMemcpyDtoDAsync failed: {err}")
+                        offset += this_nbytes
+                else:
+                    handle = stream_handles[stream_rr] if use_multi_stream else 0
+                    stream_rr = (stream_rr + 1) % num_streams
+                    err = cuda_driver.cuMemcpyDtoDAsync(
+                        dst_ptr,
+                        src_ptr,
+                        nbytes,
+                        handle,
+                    )
+                    if not _cuda_call_succeeded(err):
+                        raise RuntimeError(f"cuMemcpyDtoDAsync failed: {err}")
+                gpu_copy_bytes += nbytes
             else:
                 cpu_start = time.perf_counter()
                 ctypes.memmove(dst_ptr, int(plan.tensor.data_ptr()), plan.nbytes)
@@ -770,8 +827,9 @@ class EGMCheckpointManager:
                 cpu_copy_seconds += cpu_end - cpu_start
                 cpu_copy_bytes += plan.nbytes
         if gpu_copy_bytes > 0:
-            if self._copy_stream is not None:
-                self._copy_stream.synchronize()
+            if use_multi_stream:
+                for s in self._copy_streams:
+                    s.synchronize()
             else:
                 torch.cuda.synchronize(device=self.device_id)
         gpu_copy_end = time.perf_counter()
@@ -877,6 +935,14 @@ class EGMCheckpointManager:
         gpu_copy_bytes = 0
         gpu_copy_begin = 0.0
         gpu_copy_end = 0.0
+        load_stream_handles = self._copy_stream_handles
+        load_use_multi_stream = len(load_stream_handles) > 0
+        load_num_streams = len(load_stream_handles) if load_use_multi_stream else 1
+        load_split_threshold = max(
+            4 * 1024 * 1024,
+            int(os.environ.get("EGM_COPY_SPLIT_BYTES", 16 * 1024 * 1024)),
+        )
+        load_rr = [0]
 
         def _target_device(storage_device: str) -> torch.device:
             if storage_device == "cuda":
@@ -907,14 +973,51 @@ class EGMCheckpointManager:
                     if tensor.device.type == "cuda":
                         if gpu_copy_bytes == 0:
                             gpu_copy_begin = time.perf_counter()
-                        err = cuda_driver.cuMemcpyDtoDAsync(
-                            int(tensor.data_ptr()),
-                            tensor_data_base_ptr + offset,
-                            nbytes,
-                            self._copy_stream_handle,
-                        )
-                        if not _cuda_call_succeeded(err):
-                            raise RuntimeError(f"cuMemcpyDtoDAsync failed while loading: {err}")
+                        dst_ptr = int(tensor.data_ptr())
+                        src_ptr = tensor_data_base_ptr + offset
+                        if (
+                            load_use_multi_stream
+                            and nbytes >= load_split_threshold
+                            and load_num_streams > 1
+                        ):
+                            shard = max(128, (nbytes // load_num_streams) & ~127)
+                            local_offset = 0
+                            for i in range(load_num_streams):
+                                this_nbytes = (
+                                    shard
+                                    if i < load_num_streams - 1
+                                    else nbytes - local_offset
+                                )
+                                if this_nbytes <= 0:
+                                    continue
+                                err = cuda_driver.cuMemcpyDtoDAsync(
+                                    dst_ptr + local_offset,
+                                    src_ptr + local_offset,
+                                    this_nbytes,
+                                    load_stream_handles[i],
+                                )
+                                if not _cuda_call_succeeded(err):
+                                    raise RuntimeError(
+                                        f"cuMemcpyDtoDAsync failed while loading: {err}"
+                                    )
+                                local_offset += this_nbytes
+                        else:
+                            handle = (
+                                load_stream_handles[load_rr[0]]
+                                if load_use_multi_stream
+                                else 0
+                            )
+                            load_rr[0] = (load_rr[0] + 1) % load_num_streams
+                            err = cuda_driver.cuMemcpyDtoDAsync(
+                                dst_ptr,
+                                src_ptr,
+                                nbytes,
+                                handle,
+                            )
+                            if not _cuda_call_succeeded(err):
+                                raise RuntimeError(
+                                    f"cuMemcpyDtoDAsync failed while loading: {err}"
+                                )
                         gpu_copy_bytes += nbytes
                     else:
                         copy_start = time.perf_counter()
@@ -938,16 +1041,18 @@ class EGMCheckpointManager:
         decoded = _decode(metadata_obj)
         gpu_copy_seconds = 0.0
         if gpu_copy_bytes > 0:
-            if self._copy_stream is not None:
-                # Ensure subsequent compute stream usage sees the loaded
-                # tensor contents without requiring the caller to manually
-                # synchronize.
+            if load_use_multi_stream:
+                # Make the subsequent compute stream wait for all EGM load
+                # streams so the caller can immediately consume the loaded
+                # tensors without an explicit synchronize.
                 try:
                     current_stream = torch.cuda.current_stream(device=self.device_id)
-                    current_stream.wait_stream(self._copy_stream)
+                    for s in self._copy_streams:
+                        current_stream.wait_stream(s)
                 except Exception:
                     pass
-                self._copy_stream.synchronize()
+                for s in self._copy_streams:
+                    s.synchronize()
             else:
                 torch.cuda.synchronize(device=self.device_id)
             gpu_copy_end = time.perf_counter()
