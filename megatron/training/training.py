@@ -2314,12 +2314,49 @@ def save_checkpoint_and_time(
         # model checkpoint saving.
         gc.collect()
     timers(timer_key).stop(barrier=True)
+    save_checkpoint_duration = timers(timer_key).elapsed()
     timers.log([timer_key])
 
     # Log E2E metrics after save-checkpoint
     one_logger_utils.track_e2e_metrics()
-    save_checkpoint_duration = timers(timer_key).elapsed()
     one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
+    if getattr(args, "racer_checkpoint", False):
+        print_rank_0(
+            f"RACER save blocking time: iteration={iteration}, "
+            f"save_checkpoint_timer={float(save_checkpoint_duration) * 1000.0:.2f} ms"
+        )
+
+    if getattr(args, "racer_verify_load_checkpoint_after_save", False):
+        if not getattr(args, "racer_checkpoint", False):
+            raise RuntimeError("--racer-verify-load-checkpoint-after-save requires --racer-checkpoint")
+        verify_start = time.perf_counter()
+        loaded_iteration, loaded_flops = load_checkpoint(
+            model,
+            optimizer,
+            opt_param_scheduler,
+            checkpointing_context=checkpointing_context,
+            skip_load_to_model_and_opt=HAVE_FSDP2
+            and getattr(args, "use_torch_fsdp2", False)
+            and args.ckpt_format == "torch_dist",
+        )
+        verify_ms = (time.perf_counter() - verify_start) * 1000.0
+        if torch.distributed.is_initialized():
+            verify_tensor = torch.tensor([verify_ms], dtype=torch.float64, device=torch.cuda.current_device())
+            torch.distributed.all_reduce(verify_tensor, op=torch.distributed.ReduceOp.MAX)
+            verify_ms = float(verify_tensor.item())
+        if int(loaded_iteration) != int(iteration):
+            raise RuntimeError(
+                f"RACER load_checkpoint verification loaded iteration {loaded_iteration}, expected {iteration}"
+            )
+        if int(loaded_flops) != int(num_floating_point_operations_so_far):
+            raise RuntimeError(
+                "RACER load_checkpoint verification restored num_floating_point_operations_so_far="
+                f"{loaded_flops}, expected {num_floating_point_operations_so_far}"
+            )
+        print_rank_0(
+            f"RACER Megatron load_checkpoint-after-save verified: iteration={iteration}, "
+            f"total={verify_ms:.2f} ms"
+        )
 
     if args.log_progress and not non_persistent_ckpt:
         compute_throughputs_and_append_to_progress_log(

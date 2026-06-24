@@ -2493,6 +2493,67 @@ def _add_checkpointing_args(parser):
     group.add_argument('--ckpt-fully-parallel-save', action='store_true',
                        dest='ckpt_fully_parallel_save_deprecated',
                        help='Deprecated: see --no-ckpt-fully-parallel-save.')
+    group.add_argument('--racer-checkpoint', action='store_true',
+                       help='Enable daemon-backed RACER checkpoints for Megatron state_dicts.')
+    group.add_argument('--racer-path', type=str, default='/workspace/racer',
+                       help='Path to the RACER project root or an installed RACER package location.')
+    group.add_argument('--racer-k', type=int, default=3,
+                       help='RACER data row count. Must satisfy k + m == len(racer train ranks).')
+    group.add_argument('--racer-m', type=int, default=1,
+                       help='RACER parity row count. Must satisfy k + m == len(racer train ranks).')
+    group.add_argument('--racer-train-ranks', type=str, default=None,
+                       help='Comma-separated Megatron ranks protected by RACER. Defaults to all training ranks.')
+    group.add_argument('--racer-spare-ranks', type=str, default=None,
+                       help='Comma-separated visible CUDA device indexes used only for RACER compute.')
+    group.add_argument('--racer-buffer-size', type=int, default=64 * 1024 * 1024,
+                       help='RACER streaming chunk size in bytes.')
+    group.add_argument('--racer-payload-pool-prewarm-chunks', type=int, default=0,
+                       help='Preallocate this many training-process-owned pinned payload chunk buffers '
+                       'during RACER runtime prewarm. Set to ceil(max local checkpoint payload bytes / '
+                       '--racer-buffer-size) to keep first checkpoint save out of cudaHostAlloc.')
+    group.add_argument('--racer-retain-checkpoints', type=int, default=1,
+                       help='Number of committed RACER checkpoint tags to retain in CSD metadata.')
+    group.add_argument('--racer-optimize-cauchy', action='store_true',
+                       help='Use RACER optimized Cauchy matrix search.')
+    group.add_argument('--racer-async-offload', action='store_true',
+                       help='Do not wait on RACER CUDA streams after daemon-backed store work is launched.')
+    group.add_argument('--racer-distributed-store', action='store_true',
+                       help='Use RACER distributed spare-worker store/load with daemon-owned CSD storage.')
+    group.add_argument('--racer-storage-backend', type=str, default='csd_native_pinned',
+                       choices=['csd_native_pinned', 'csd_egm'],
+                       help='RACER chunk storage backend. csd_native_pinned requires a native_pinned CSD daemon; '
+                       'csd_egm requires a real daemon-owned EGM native transport. '
+                       'Fallback storage paths are intentionally disabled.')
+    group.add_argument('--racer-csd-host', type=str, default='127.0.0.1',
+                       help='Checkpoint Storage Daemon host for --racer-storage-backend=csd_*.')
+    group.add_argument('--racer-csd-port', type=int, default=None,
+                       help='Checkpoint Storage Daemon port for --racer-storage-backend=csd_*.')
+    group.add_argument('--racer-csd-socket-path', type=str, default=None,
+                       help='Checkpoint Storage Daemon Unix socket path for native daemon-owned pinned transport. '
+                       'When set, it takes precedence over --racer-csd-host/--racer-csd-port.')
+    group.add_argument('--racer-csd-authkey', type=str, default='racer-csd',
+                       help='Checkpoint Storage Daemon auth key for --racer-storage-backend=csd_*.')
+    group.add_argument('--racer-csd-cuda-register-fd-mappings',
+                       action='store_true',
+                       default=False,
+                       help='Experimental: call cudaHostRegister on CSD fd mappings in the training process. '
+                       'This may improve direct CUDA copies on supported drivers, but is disabled by default.')
+    group.add_argument('--racer-profile-dir', type=str, default=None,
+                       help='Optional directory for per-rank RACER profile JSONL files.')
+    group.add_argument('--racer-manifest-dir', type=str, default=None,
+                       help='Directory for RACER per-rank checkpoint manifests. Defaults to <save>/racer_manifests.')
+    group.add_argument('--racer-verify-on-save', action='store_true',
+                       help='After every RACER memory save, load payloads from RACER memory and verify byte checksums.')
+    group.add_argument('--racer-verify-load-checkpoint-after-save', action='store_true',
+                       help='After each RACER memory save, call Megatron load_checkpoint from RACER memory and continue training.')
+    group.add_argument('--racer-verify-rank', type=int, default=0,
+                       help='Train rank decoded by --racer-verify-on-save.')
+    group.add_argument('--racer-recover-ranks', type=str, default=None,
+                       help='Comma-separated train ranks to force RACER recovery before checkpoint load.')
+    group.add_argument('--racer-replacement-mapping', type=str, default=None,
+                       help='Comma-separated failed:replacement entries for RACER recovery output routing.')
+    group.add_argument('--racer-force-recover', action='store_true',
+                       help='Force the current live rank through the RACER recovery path during memory checkpoint load.')
     return parser
 
 

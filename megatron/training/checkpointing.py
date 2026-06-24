@@ -38,7 +38,7 @@ from megatron.core.utils import get_torch_version, is_torch_min_version
 
 from ..core.dist_checkpointing.serialization import get_default_save_sharded_strategy
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
-from . import ft_integration, wandb_utils
+from . import ft_integration, racer_checkpointing, wandb_utils
 from .async_utils import is_empty_async_queue, schedule_async_save
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest, _disable_gc
 from .global_vars import get_args
@@ -477,6 +477,15 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
                  f"from iteration {iteration:7d}")
 
 
+def _racer_max_ms(value_ms: float) -> float:
+    if not torch.distributed.is_initialized():
+        return float(value_ms)
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    tensor = torch.tensor([float(value_ms)], dtype=torch.float64, device=device)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+    return float(tensor.item())
+
+
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
                     train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
@@ -499,6 +508,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     """
     start_ckpt = time()
     args = get_args()
+    racer_profile = {} if racer_checkpointing.racer_checkpoint_enabled(args) else None
 
     if args.async_save and not is_empty_async_queue():
         print_rank_0('WARNING: Starting a checkpoint save before previous has finished. Consider increasing the checkpoint interval.')
@@ -538,6 +548,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     print_rank_0(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] saving checkpoint "
                  f"at iteration {iteration:7d} to {save_dir} in {ckpt_format} format")
 
+    if racer_checkpointing.racer_checkpoint_enabled(args):
+        if args.async_save:
+            raise NotImplementedError("RACER checkpointing does not support --async-save yet.")
+
+    pre_state_start = time()
     # Collect rng state across data parallel ranks.
     if tp_group is None and pp_group is None:
         tp_group = mpu.get_tensor_model_parallel_group()
@@ -557,6 +572,10 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     # Save dataloader state if the dataloader supports it (currently only Megatron Energon).
     maybe_save_dataloader_state(train_data_iterator, iteration, getattr(args, "dataloader_save", None))
+    if racer_profile is not None:
+        racer_profile["pre_state_ms"] = _racer_max_ms((time() - pre_state_start) * 1000.0)
+
+    racer_distributed_optimizer_state = None
 
     # Save distributed optimizer's custom parameter state.
     if (
@@ -565,14 +584,22 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         and optimizer is not None
         and ckpt_type == CheckpointType.LEGACY
     ):
-        optim_checkpoint_name = \
-            get_distributed_optimizer_checkpoint_name(checkpoint_name)
-        ensure_directory_exists(optim_checkpoint_name)
-        if not optimizer.is_stub_optimizer:
-            optimizer.save_parameter_state(optim_checkpoint_name)
+        if racer_checkpointing.racer_checkpoint_enabled(args):
+            optimizer_capture_start = time()
+            racer_distributed_optimizer_state = racer_checkpointing.capture_distributed_optimizer_state(
+                args, optimizer
+            )
+            if racer_profile is not None:
+                racer_profile["optimizer_capture_ms"] = _racer_max_ms((time() - optimizer_capture_start) * 1000.0)
+        else:
+            optim_checkpoint_name = \
+                get_distributed_optimizer_checkpoint_name(checkpoint_name)
+            ensure_directory_exists(optim_checkpoint_name)
+            if not optimizer.is_stub_optimizer:
+                optimizer.save_parameter_state(optim_checkpoint_name)
 
     # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
-    if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
+    if (not racer_checkpointing.racer_checkpoint_enabled(args)) and getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
         dp_rank = mpu.get_data_parallel_rank()
         optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
         ensure_directory_exists(optim_checkpoint_name)
@@ -599,6 +626,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                              f' {sharded_sd_metadata["distrib_optim_sharding_type"]}')
         else:
             sharded_sd_metadata = None
+        state_dict_start = time()
         state_dict = generate_state_dict(
             args,
             model,
@@ -610,9 +638,28 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             model_sd_kwargs=dict(metadata=sharded_sd_metadata),
             rerun_state=rerun_state,
         )
+        if racer_profile is not None:
+            racer_profile["state_dict_ms"] = _racer_max_ms((time() - state_dict_start) * 1000.0)
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
-        if ckpt_type == CheckpointType.GLOBAL and ckpt_format == "torch_dist":
+        if racer_checkpointing.racer_checkpoint_enabled(args):
+            racer_save_start = time()
+            racer_checkpointing.save_memory_checkpoint(
+                args,
+                iteration=iteration,
+                release=release,
+                ckpt_type=ckpt_type.name,
+                state_dict=state_dict,
+                distributed_optimizer_state=racer_distributed_optimizer_state,
+                content_metadata=(
+                    _clean_metadata_for_serialization(sharded_sd_metadata)
+                    if sharded_sd_metadata is not None
+                    else None
+                ),
+            )
+            if racer_profile is not None:
+                racer_profile["racer_adapter_save_ms"] = _racer_max_ms((time() - racer_save_start) * 1000.0)
+        elif ckpt_type == CheckpointType.GLOBAL and ckpt_format == "torch_dist":
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
                 ensure_directory_exists(checkpoint_name, check_parent=False)
@@ -709,7 +756,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 checkpointing_context['local_checkpoint_cache'] = cacheable_metadata
             else:
                 assert ckpt_type == CheckpointType.LEGACY
-                # Save.
                 ensure_directory_exists(checkpoint_name)
                 torch.save(state_dict, checkpoint_name)
     start_misc = time()
@@ -725,7 +771,16 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             or torch.distributed.get_rank() == 0:
         tracker_filename = get_checkpoint_tracker_filename(save_dir)
 
-        if ckpt_type == CheckpointType.LOCAL:
+        if racer_checkpointing.racer_checkpoint_enabled(args):
+            def iter_finalize_fn():
+                tensor_rank_to_print = (tensor_rank if tensor_rank is not None else mpu.get_tensor_model_parallel_rank()) + 1
+                pipeline_rank_to_print = (pipeline_rank if pipeline_rank is not None else mpu.get_pipeline_model_parallel_rank()) + 1
+                print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully saved "
+                             f"RACER memory checkpoint from iteration {int(iteration):7d} "
+                             f"[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, "
+                             f"p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]")
+
+        elif ckpt_type == CheckpointType.LOCAL:
             def iter_finalize_fn():
                 print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully "
                              f"saved local checkpoint from iteration {iteration:7d}")
@@ -798,8 +853,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             onelogger_finalize_fn()
 
     # Additional callback for wandb (last rank)
-    if not torch.distributed.is_initialized() \
-       or is_last_rank():
+    if (not racer_checkpointing.racer_checkpoint_enabled(args)) and (
+       not torch.distributed.is_initialized()
+       or is_last_rank()):
         def wandb_finalize_fn():
             wandb_utils.on_save_checkpoint_success(checkpoint_name, get_checkpoint_tracker_filename(save_dir), save_dir, iteration)
         if args.async_save:
@@ -819,6 +875,19 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 
     end_misc = time()
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
+    if racer_profile is not None:
+        racer_profile["finalize_ms"] = _racer_max_ms((end_misc - start_misc) * 1000.0)
+        racer_profile["save_checkpoint_fn_total_ms"] = _racer_max_ms((end_misc - start_ckpt) * 1000.0)
+        print_rank_0(
+            "RACER checkpoint blocking profile: "
+            f"iteration={int(iteration)}, "
+            f"pre_state={float(racer_profile.get('pre_state_ms', 0.0)):.2f} ms, "
+            f"optimizer_capture={float(racer_profile.get('optimizer_capture_ms', 0.0)):.2f} ms, "
+            f"state_dict={float(racer_profile.get('state_dict_ms', 0.0)):.2f} ms, "
+            f"racer_adapter_save={float(racer_profile.get('racer_adapter_save_ms', 0.0)):.2f} ms, "
+            f"finalize={float(racer_profile.get('finalize_ms', 0.0)):.2f} ms, "
+            f"save_checkpoint_fn_total={float(racer_profile.get('save_checkpoint_fn_total_ms', 0.0)):.2f} ms"
+        )
 
     ft_integration.on_checkpointing_end(is_async_finalization=False)
 
@@ -1256,6 +1325,22 @@ def _load_base_checkpoint(
     # Record the iteration loaded (stored separately from args to avoid
     # polluting checkpoints, since args is saved in checkpoints).
     set_loaded_iteration(iteration)
+
+    if racer_checkpointing.racer_checkpoint_enabled(args):
+        memory_checkpoint = racer_checkpointing.load_memory_checkpoint(
+            args,
+            iteration=None if iteration == -1 else iteration,
+            release=release,
+        )
+        if memory_checkpoint is not None:
+            state_dict, checkpoint_name, memory_iteration, release, report = memory_checkpoint
+            set_loaded_iteration(memory_iteration)
+            memory_ckpt_type = str(report.get("ckpt_type", "LEGACY"))
+            try:
+                checkpoint_type = CheckpointType[memory_ckpt_type]
+            except KeyError:
+                checkpoint_type = CheckpointType.LEGACY
+            return state_dict, checkpoint_name, release, checkpoint_type
 
     if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
         if non_persistent_iteration >= iteration:
@@ -1824,6 +1909,10 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 sys.exit()
     num_floating_point_operations_so_far = state_dict.get('num_floating_point_operations_so_far', 0)
 
+    racer_distributed_optimizer_state = None
+    if racer_checkpointing.racer_checkpoint_enabled(args):
+        racer_distributed_optimizer_state = racer_checkpointing.pop_distributed_optimizer_state(state_dict)
+
     # Check arguments.
     if 'args' in state_dict and not args.finetune:
         checkpoint_args = state_dict['args']
@@ -1867,7 +1956,7 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if not release and not args.finetune and not args.no_load_optim:
         try:
             # Load state dict.
-            if getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
+            if (not racer_checkpointing.racer_checkpoint_enabled(args)) and getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
                 dp_rank = mpu.get_data_parallel_rank()
                 optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
@@ -1879,18 +1968,30 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
             # For distributed checkpoint it's already loaded in load_state_dict above
             is_torch_dist = ckpt_format == "torch_dist"
             if args.use_distributed_optimizer and not is_torch_dist and ckpt_format not in ["torch_dcp", "fsdp_dtensor"]:
-                # NOTE: this is a manual read of the tracker file.
-                # This code should not be reached when reading from a non_persistent checkpoint
-                assert not is_torch_dist
-                tracker_filename = get_checkpoint_tracker_filename(load_dir)
-                iteration, release = read_metadata(tracker_filename)
-                model_checkpoint_name = \
-                    get_checkpoint_name(load_dir, iteration, release)
-                optim_checkpoint_name = \
-                    get_distributed_optimizer_checkpoint_name(
-                        model_checkpoint_name)
-                optimizer.load_parameter_state(optim_checkpoint_name,
-                                               update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format)
+                if racer_distributed_optimizer_state is not None:
+                    racer_checkpointing.load_distributed_optimizer_state(
+                        optimizer,
+                        racer_distributed_optimizer_state,
+                        update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format,
+                    )
+                elif racer_checkpointing.racer_checkpoint_enabled(args):
+                    raise RuntimeError(
+                        "RACER memory checkpoint did not contain distributed optimizer parameter state. "
+                        "Refusing to fall back to checkpoint files while --racer-checkpoint is enabled."
+                    )
+                else:
+                    # NOTE: this is a manual read of the tracker file.
+                    # This code should not be reached when reading from a non_persistent checkpoint
+                    assert not is_torch_dist
+                    tracker_filename = get_checkpoint_tracker_filename(load_dir)
+                    iteration, release = read_metadata(tracker_filename)
+                    model_checkpoint_name = \
+                        get_checkpoint_name(load_dir, iteration, release)
+                    optim_checkpoint_name = \
+                        get_distributed_optimizer_checkpoint_name(
+                            model_checkpoint_name)
+                    optimizer.load_parameter_state(optim_checkpoint_name,
+                                                   update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format)
 
             # Load scheduler.
             if opt_param_scheduler is not None:
