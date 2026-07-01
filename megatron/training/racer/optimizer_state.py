@@ -36,11 +36,13 @@ def load_distributed_optimizer_state(
     chained = getattr(optimizer, "chained_optimizers", None)
     if chained is not None:
         states = parameter_state if isinstance(parameter_state, list) else [parameter_state]
-        for idx, opt in enumerate(chained):
-            state = states[idx] if idx < len(states) else None
-            load_one_distributed_optimizer_state(
-                opt, state, update_legacy_format=update_legacy_format
+        if len(states) != len(chained):
+            raise ValueError(
+                "RACER distributed optimizer state count does not match chained optimizers: "
+                f"state_count={len(states)}, optimizer_count={len(chained)}"
             )
+        for idx, opt in enumerate(chained):
+            load_one_distributed_optimizer_state(opt, states[idx], update_legacy_format=update_legacy_format)
         return
     raise TypeError("optimizer does not support in-memory distributed parameter state loading")
 

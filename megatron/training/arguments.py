@@ -2504,7 +2504,15 @@ def _add_checkpointing_args(parser):
     group.add_argument('--racer-train-ranks', type=str, default=None,
                        help='Comma-separated Megatron ranks protected by RACER. Defaults to all training ranks.')
     group.add_argument('--racer-spare-ranks', type=str, default=None,
-                       help='Comma-separated visible CUDA device indexes used only for RACER compute.')
+                       help='Comma-separated RACER spare ranks. In local launch mode these are visible CUDA '
+                       'device indexes on the coordinator node; in remote launch mode these are external '
+                       'RACER process-group rank labels, e.g. 8 for 8 train ranks + 1 spare.')
+    group.add_argument('--racer-spare-launch-mode', type=str, default='local',
+                       choices=['local', 'remote'],
+                       help='Launch RACER spare workers locally from the coordinator, or expect remote spare '
+                       'worker processes to connect to the RACER runtime TCPStore.')
+    group.add_argument('--racer-runtime-port', type=int, default=None,
+                       help='Fixed RACER runtime TCPStore port. Required for --racer-spare-launch-mode=remote.')
     group.add_argument('--racer-buffer-size', type=int, default=64 * 1024 * 1024,
                        help='RACER streaming chunk size in bytes.')
     group.add_argument('--racer-payload-pool-prewarm-chunks', type=int, default=0,

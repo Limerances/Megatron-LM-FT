@@ -9,9 +9,11 @@ chunks only through a restart-aware RACER Checkpoint Storage Daemon.
 from __future__ import annotations
 
 import atexit
+import base64
 import json
 import multiprocessing as mp
 import os
+import pickle
 import socket
 import sys
 import time
@@ -27,6 +29,7 @@ from megatron.training.racer import optimizer_state, rank_map, session_state, te
 DISTRIB_OPTIM_STATE_KEY = optimizer_state.DISTRIB_OPTIM_STATE_KEY
 _META_KEY = "__racer_memory_checkpoint_meta__"
 _MANIFEST_DIR = "racer_manifests"
+_TREE_MANIFEST_CSD_PREFIX = "__racer_megatron_tree_manifest__:"
 _SESSION = session_state.RacerSessionState()
 
 
@@ -102,16 +105,40 @@ def _racer_chunk_storage_from_options(storage_backend: str, storage_options: dic
     normalized = str(storage_backend).lower().replace("-", "_")
     if normalized not in _CSD_STORAGE_BACKENDS:
         return None
+    options = dict(storage_options or {})
+    cache_key = _racer_chunk_storage_cache_key(normalized, options)
+    cached = _SESSION.chunk_storage_clients.get(cache_key)
+    if cached is not None:
+        return cached
     from racer.csd import CheckpointStorageDaemonClient  # type: ignore
 
-    options = dict(storage_options or {})
     client = CheckpointStorageDaemonClient(
         options["address"],
         authkey=options.get("authkey"),
         cuda_register_fd_mappings=bool(options.get("cuda_register_fd_mappings", False)),
     )
     _validate_csd_backend_matches_cli(normalized, client)
+    _SESSION.chunk_storage_clients[cache_key] = client
     return client
+
+
+def _racer_chunk_storage_cache_key(storage_backend: str, storage_options: dict[str, Any]) -> tuple[Any, ...]:
+    address = storage_options.get("address")
+    if isinstance(address, (list, tuple)):
+        address_key: Any = tuple(address)
+    else:
+        address_key = str(address)
+    authkey = storage_options.get("authkey")
+    if isinstance(authkey, (bytes, bytearray)):
+        authkey_key: Any = bytes(authkey)
+    else:
+        authkey_key = str(authkey)
+    return (
+        str(storage_backend).lower().replace("-", "_"),
+        address_key,
+        authkey_key,
+        bool(storage_options.get("cuda_register_fd_mappings", False)),
+    )
 
 
 def _validate_csd_backend_matches_cli(storage_backend: str, client: Any) -> None:
@@ -262,6 +289,8 @@ def load_memory_checkpoint(
     rank = _rank()
     if rank == 0:
         tag = _select_tag(iteration)
+        if tag is not None and not _manifest_chunks_committed(args, str(tag)):
+            raise RuntimeError(f"RACER checkpoint {tag!r} is not fully committed in CSD")
         if tag is None:
             tag = _select_manifest_tag(args, iteration, release)
     else:
@@ -276,6 +305,11 @@ def load_memory_checkpoint(
     found = tag is not None
     loaded_iteration = _iteration_from_tag(str(tag)) if tag is not None else -1
     if not found:
+        if release or (iteration is not None and int(iteration) >= 0):
+            raise RuntimeError(
+                "requested RACER checkpoint is not available or not fully committed: "
+                f"iteration={iteration}, release={release}"
+            )
         if racer_distributed_store_enabled(args) and _distributed_initialized():
             prewarm = _prewarm_distributed_runtime_and_staging(args)
             _print_rank0(
@@ -290,7 +324,7 @@ def load_memory_checkpoint(
         return None
 
     load_tag = str(tag)
-    _ensure_tree_checkpoint(args, load_tag)
+    _ensure_tree_checkpoint(args, load_tag, rank=_replacement_source_rank_for_current_process(replacement_mapping))
     if load_tag in _SESSION.tree_checkpoints:
         state_dict, report = _distributed_load_tensor_tree(
             args,
@@ -466,6 +500,17 @@ def _manifest_filename(tag: str) -> str:
     return tag.replace(":", "__").replace("/", "_")
 
 
+def _tree_manifest_csd_tag(tag: str, rank: int) -> str:
+    return f"{_TREE_MANIFEST_CSD_PREFIX}rank_{int(rank):05d}:{str(tag)}"
+
+
+def _checkpoint_tag_from_tree_manifest_csd_tag(tag: str, rank: int = 0) -> str | None:
+    prefix = f"{_TREE_MANIFEST_CSD_PREFIX}rank_{int(rank):05d}:"
+    if not str(tag).startswith(prefix):
+        return None
+    return str(tag)[len(prefix) :]
+
+
 def _manifest_path(args: Any, tag: str, rank: int | None = None) -> Path:
     manifest_rank = _rank() if rank is None else int(rank)
     return _manifest_root(args) / f"{_manifest_filename(tag)}.rank_{manifest_rank:05d}.pt"
@@ -482,26 +527,91 @@ def _tree_manifest(tree: dict[str, Any]) -> dict[str, Any]:
 
 
 def _write_tree_manifest(args: Any, tag: str, tree: dict[str, Any]) -> None:
+    tree["source_rank"] = int(tree.get("source_rank", _rank()))
+    manifest = _tree_manifest(tree)
     path = _manifest_path(args, tag)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(_tree_manifest(tree), path)
+    torch.save(manifest, path)
+    if not _racer_csd_storage_enabled(args):
+        return
+    storage = _racer_chunk_storage(args)
+    if storage is None:
+        return
+    csd_manifest = {
+        "manifest_version": 1,
+        "racer_manifest_kind": "megatron_tensor_tree",
+        "checkpoint_tag": str(tag),
+        "source_rank": int(tree["source_rank"]),
+        "tree_pickle_b64": base64.b64encode(pickle.dumps(manifest, protocol=4)).decode("ascii"),
+    }
+    csd_tag = _tree_manifest_csd_tag(tag, int(tree["source_rank"]))
+    try:
+        storage.begin(csd_tag, csd_manifest, expected_chunks=0)
+        storage.put_manifest(csd_tag, csd_manifest)
+        storage.commit(csd_tag)
+    except Exception as exc:
+        raise RuntimeError(f"failed to store RACER tensor-tree manifest in CSD for tag {tag!r}") from exc
 
 
-def _load_tree_manifest(args: Any, tag: str) -> dict[str, Any] | None:
-    path = _manifest_path(args, tag)
-    if not path.exists():
-        return None
-    manifest = torch.load(path, map_location="cpu", weights_only=False)
+def _load_tree_manifest(args: Any, tag: str, rank: int | None = None) -> dict[str, Any] | None:
+    manifest_rank = _rank() if rank is None else int(rank)
+    path = _manifest_path(args, tag, rank=manifest_rank)
+    if path.exists():
+        manifest = torch.load(path, map_location="cpu", weights_only=False)
+    else:
+        manifest = _load_tree_manifest_from_csd(args, tag, manifest_rank)
+        if manifest is None:
+            return None
     if not isinstance(manifest, dict):
         raise TypeError(f"RACER manifest at {path} is not a dict")
+    manifest.setdefault("source_rank", int(manifest_rank))
     manifest.setdefault("source_tensors", [])
     return manifest
 
 
-def _ensure_tree_checkpoint(args: Any, tag: str) -> None:
-    if tag in _SESSION.tree_checkpoints:
+def _load_tree_manifest_from_csd(args: Any, tag: str, rank: int) -> dict[str, Any] | None:
+    if not _racer_csd_storage_enabled(args):
+        return None
+    storage = _racer_chunk_storage(args)
+    if storage is None:
+        return None
+    try:
+        raw = storage.get_manifest(_tree_manifest_csd_tag(tag, rank))
+    except KeyError:
+        return None
+    manifest = dict(raw)
+    if manifest.get("racer_manifest_kind") == "megatron_tensor_tree" and isinstance(
+        manifest.get("tree_pickle_b64"), str
+    ):
+        tree_manifest = pickle.loads(base64.b64decode(str(manifest["tree_pickle_b64"]).encode("ascii")))
+        if not isinstance(tree_manifest, dict):
+            raise TypeError(f"RACER CSD tensor-tree manifest for tag {tag!r} rank {rank} is not a dict")
+    elif manifest.get("racer_manifest_kind") == "megatron_tensor_tree" and isinstance(manifest.get("tree"), dict):
+        tree_manifest = dict(manifest["tree"])
+    else:
+        tree_manifest = manifest
+    tree_manifest.setdefault("source_rank", int(rank))
+    return tree_manifest
+
+
+def _tree_manifest_available(args: Any, tag: str, rank: int = 0) -> bool:
+    return _manifest_path(args, tag, rank=rank).exists() or _load_tree_manifest_from_csd(args, tag, rank) is not None
+
+
+def _replacement_source_rank_for_current_process(replacement_mapping: dict[int, int] | None) -> int:
+    rank = _rank()
+    for source_rank, replacement_rank in dict(replacement_mapping or {}).items():
+        if int(replacement_rank) == rank:
+            return int(source_rank)
+    return rank
+
+
+def _ensure_tree_checkpoint(args: Any, tag: str, rank: int | None = None) -> None:
+    manifest_rank = _rank() if rank is None else int(rank)
+    existing = _SESSION.tree_checkpoints.get(tag)
+    if existing is not None and int(existing.get("source_rank", manifest_rank)) == manifest_rank:
         return
-    manifest = _load_tree_manifest(args, tag)
+    manifest = _load_tree_manifest(args, tag, rank=manifest_rank)
     if manifest is not None:
         _SESSION.tree_checkpoints[tag] = manifest
         iteration = _iteration_from_tag(tag)
@@ -512,7 +622,7 @@ def _ensure_tree_checkpoint(args: Any, tag: str) -> None:
 def _manifest_chunks_committed(args: Any, tag: str) -> bool:
     if not _racer_csd_storage_enabled(args):
         return True
-    manifest = _load_tree_manifest(args, tag)
+    manifest = _load_tree_manifest(args, tag, rank=0)
     if manifest is None:
         return False
     storage = _racer_chunk_storage(args)
@@ -528,19 +638,23 @@ def _manifest_chunks_committed(args: Any, tag: str) -> bool:
 
 
 def _manifest_tag_available(args: Any, tag: str) -> bool:
-    return _manifest_path(args, tag, rank=0).exists() and _manifest_chunks_committed(args, tag)
+    return _tree_manifest_available(args, tag, rank=0) and _manifest_chunks_committed(args, tag)
 
 
 def _select_manifest_tag(args: Any, iteration: int | None, release: bool) -> str | None:
     root = _manifest_root(args)
     if not root.exists():
-        return None
+        return _select_manifest_tag_from_csd(args, iteration, release)
     if release:
         tag = _tag_for_iteration(0, True)
-        return tag if _manifest_tag_available(args, tag) else None
+        if _manifest_tag_available(args, tag):
+            return tag
+        return _select_manifest_tag_from_csd(args, iteration, release)
     if iteration is not None and int(iteration) >= 0:
         tag = _tag_for_iteration(int(iteration), False)
-        return tag if _manifest_tag_available(args, tag) else None
+        if _manifest_tag_available(args, tag):
+            return tag
+        return _select_manifest_tag_from_csd(args, iteration, release)
     candidates: list[tuple[int, str]] = []
     for path in root.glob("*.rank_00000.pt"):
         name = path.name
@@ -552,7 +666,44 @@ def _select_manifest_tag(args: Any, iteration: int | None, release: bool) -> str
             candidates.append((iter_value, tag))
     if not candidates:
         release_tag = _tag_for_iteration(0, True)
-        return release_tag if _manifest_tag_available(args, release_tag) else None
+        if _manifest_tag_available(args, release_tag):
+            return release_tag
+        return _select_manifest_tag_from_csd(args, iteration, release)
+    for _, tag in sorted(candidates, reverse=True):
+        if _manifest_chunks_committed(args, tag):
+            return tag
+    csd_tag = _select_manifest_tag_from_csd(args, iteration, release)
+    if csd_tag is not None:
+        return csd_tag
+    return None
+
+
+def _select_manifest_tag_from_csd(args: Any, iteration: int | None, release: bool) -> str | None:
+    if not _racer_csd_storage_enabled(args):
+        return None
+    storage = _racer_chunk_storage(args)
+    if storage is None:
+        return None
+    try:
+        raw_tags = list(storage.list_tags())
+    except Exception:
+        return None
+    candidates: list[tuple[int, str]] = []
+    for raw_tag in raw_tags:
+        tag = _checkpoint_tag_from_tree_manifest_csd_tag(str(raw_tag), rank=0)
+        if tag is None:
+            continue
+        if release:
+            if tag == _tag_for_iteration(0, True) and _manifest_chunks_committed(args, tag):
+                return tag
+            continue
+        iter_value = _iteration_from_tag(tag)
+        if iteration is not None and int(iteration) >= 0:
+            if iter_value == int(iteration) and _manifest_chunks_committed(args, tag):
+                return tag
+            continue
+        if iter_value >= 0:
+            candidates.append((iter_value, tag))
     for _, tag in sorted(candidates, reverse=True):
         if _manifest_chunks_committed(args, tag):
             return tag
@@ -581,6 +732,26 @@ def _free_tcp_port() -> int:
 
 def _racer_store_host() -> str:
     return os.environ.get("MASTER_ADDR", "127.0.0.1")
+
+
+def _racer_spare_launch_mode(args: Any) -> str:
+    mode = str(getattr(args, "racer_spare_launch_mode", "local")).lower().replace("-", "_")
+    if mode not in {"local", "remote"}:
+        raise ValueError(f"unsupported --racer-spare-launch-mode={mode!r}")
+    return mode
+
+
+def _racer_runtime_port(args: Any) -> int | None:
+    value = getattr(args, "racer_runtime_port", None)
+    if value is None:
+        env_value = os.environ.get("RACER_RUNTIME_PORT")
+        if not env_value:
+            return None
+        value = env_value
+    port = int(value)
+    if port <= 0 or port > 65535:
+        raise ValueError(f"invalid RACER runtime TCPStore port: {port}")
+    return port
 
 
 def _racer_pg_train_ranks(args: Any) -> list[int]:
@@ -780,12 +951,17 @@ def _distributed_runtime(args: Any) -> _RacerDistributedRuntime:
     racer_spare_ranks = _racer_pg_spare_ranks(args)
     world_size = len(train_ranks) + len(spare_ranks)
     coordinator_rank = int(train_ranks[0])
-    for spare_cuda_device in spare_ranks:
-        if torch.cuda.device_count() <= int(spare_cuda_device):
-            raise RuntimeError(
-                f"RACER distributed spare worker needs visible CUDA device {int(spare_cuda_device)}, "
-                f"but torch sees {torch.cuda.device_count()} devices"
-            )
+    spare_launch_mode = _racer_spare_launch_mode(args)
+    runtime_port = _racer_runtime_port(args)
+    if spare_launch_mode == "remote" and runtime_port is None:
+        raise RuntimeError("--racer-runtime-port is required when --racer-spare-launch-mode=remote")
+    if spare_launch_mode == "local":
+        for spare_cuda_device in spare_ranks:
+            if torch.cuda.device_count() <= int(spare_cuda_device):
+                raise RuntimeError(
+                    f"RACER distributed spare worker needs visible CUDA device {int(spare_cuda_device)}, "
+                    f"but torch sees {torch.cuda.device_count()} devices"
+                )
 
     port_tensor = torch.zeros(1, dtype=torch.long, device=device)
     store_host = _racer_store_host()
@@ -795,7 +971,7 @@ def _distributed_runtime(args: Any) -> _RacerDistributedRuntime:
     if rank == coordinator_rank:
         last_bind_error: Exception | None = None
         for _ in range(20):
-            port = _free_tcp_port()
+            port = int(runtime_port) if runtime_port is not None else _free_tcp_port()
             try:
                 store = torch.distributed.TCPStore(
                     store_host,
@@ -810,35 +986,39 @@ def _distributed_runtime(args: Any) -> _RacerDistributedRuntime:
                 break
             except Exception as exc:
                 message = str(exc)
-                if "EADDRINUSE" not in message and "address already in use" not in message:
+                if runtime_port is not None or (
+                    "EADDRINUSE" not in message and "address already in use" not in message
+                ):
                     raise
                 last_bind_error = exc
         if store is None:
             raise RuntimeError("failed to bind RACER distributed TCPStore on a free local port") from last_bind_error
         init_profile["racer_runtime_tcpstore_create_ms"] = (time.perf_counter() - store_start) * 1000.0
-        ctx = mp.get_context("spawn")
         spawn_start = time.perf_counter()
-        for spare_rank, spare_cuda_device in zip(racer_spare_ranks, spare_ranks):
-            worker = ctx.Process(
-                target=_spare_worker_main,
-                kwargs={
-                    "port": int(port_tensor.item()),
-                    "store_host": store_host,
-                    "world_size": int(world_size),
-                    "spare_rank": int(spare_rank),
-                    "spare_cuda_device": int(spare_cuda_device),
-                    "config_data": _distributed_config_dict(args),
-                    "racer_path": str(getattr(args, "racer_path", "")),
-                    "storage_backend": _racer_storage_backend(args),
-                    "storage_options": (
-                        _racer_csd_storage_options(args) if _racer_csd_storage_enabled(args) else None
-                    ),
-                },
-                daemon=True,
-            )
-            worker.start()
-            workers.append(worker)
+        if spare_launch_mode == "local":
+            ctx = mp.get_context("spawn")
+            for spare_rank, spare_cuda_device in zip(racer_spare_ranks, spare_ranks):
+                worker = ctx.Process(
+                    target=_spare_worker_main,
+                    kwargs={
+                        "port": int(port_tensor.item()),
+                        "store_host": store_host,
+                        "world_size": int(world_size),
+                        "spare_rank": int(spare_rank),
+                        "spare_cuda_device": int(spare_cuda_device),
+                        "config_data": _distributed_config_dict(args),
+                        "racer_path": str(getattr(args, "racer_path", "")),
+                        "storage_backend": _racer_storage_backend(args),
+                        "storage_options": (
+                            _racer_csd_storage_options(args) if _racer_csd_storage_enabled(args) else None
+                        ),
+                    },
+                    daemon=True,
+                )
+                worker.start()
+                workers.append(worker)
         init_profile["racer_runtime_worker_spawn_ms"] = (time.perf_counter() - spawn_start) * 1000.0
+        init_profile["racer_runtime_remote_spare"] = 1.0 if spare_launch_mode == "remote" else 0.0
     torch.distributed.broadcast(port_tensor, src=coordinator_rank)
     port = int(port_tensor.item())
     if rank != coordinator_rank:
@@ -1598,6 +1778,7 @@ def _distributed_load_tensor_tree(
         _accumulate_numeric_profile(racer_load_profile_local, payload_profile)
         if chunk_index < len(chunks):
             materialize_start = time.perf_counter()
+            materialize_stream.wait_stream(torch.cuda.current_stream(device))
             with torch.cuda.stream(materialize_stream):
                 for segment in chunks[chunk_index].get("segments", []):
                     tensor_id = int(segment["tensor_id"])
@@ -1904,6 +2085,7 @@ def _local_load_tensor_tree(
         load_fetch_ms_local += (time.perf_counter() - fetch_start) * 1000.0
         if chunk_index < len(chunks):
             materialize_start = time.perf_counter()
+            materialize_stream.wait_stream(torch.cuda.current_stream(device))
             with torch.cuda.stream(materialize_stream):
                 for segment in chunks[chunk_index].get("segments", []):
                     tensor_id = int(segment["tensor_id"])
