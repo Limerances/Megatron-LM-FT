@@ -616,9 +616,16 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
 
     # Collect args, model, RNG.
-    if not torch.distributed.is_initialized() \
-            or mpu.get_expert_data_parallel_rank() == 0 \
-            or ckpt_type != CheckpointType.LEGACY:
+    # Legacy Megatron disk checkpoints are only written by the first data
+    # parallel replica. RACER protects the configured train ranks directly, so
+    # every protected rank must enter the RACER save path and its collectives.
+    should_collect_state = (
+        not torch.distributed.is_initialized()
+        or mpu.get_expert_data_parallel_rank() == 0
+        or ckpt_type != CheckpointType.LEGACY
+        or racer_checkpointing.racer_checkpoint_enabled(args)
+    )
+    if should_collect_state:
         if ckpt_type != CheckpointType.LEGACY:
             sharded_sd_metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=dp_cp_group)
             if args.use_distributed_optimizer:
