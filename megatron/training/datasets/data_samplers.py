@@ -3,6 +3,7 @@
 """Dataloaders."""
 
 
+import os
 import random
 
 import numpy as np
@@ -83,11 +84,13 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         extra_kwargs = {"collate_fn": lambda x: x,}
     else:
         extra_kwargs = {}
+    pin_memory_env = str(os.environ.get("MEGATRON_DATALOADER_PIN_MEMORY", "1")).lower()
+    pin_memory = pin_memory_env not in {"", "0", "false", "no", "off", "disabled"}
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         persistent_workers=True if args.num_workers > 0 else False,
         worker_init_fn=maybe_worker_init_fn,
         **extra_kwargs,

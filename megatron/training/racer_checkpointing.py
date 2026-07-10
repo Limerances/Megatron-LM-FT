@@ -80,6 +80,32 @@ def _racer_csd_storage_enabled(args: Any) -> bool:
     return _racer_storage_backend(args) in _CSD_STORAGE_BACKENDS
 
 
+def _racer_csd_delete_coordinator_rank() -> int:
+    if os.environ.get("RACER_CSD_PER_NODE", "0").lower() not in {"1", "true", "yes", "on"}:
+        return 0
+    value = os.environ.get("RACER_CSD_LOCAL_COORDINATOR_RANK")
+    if value not in (None, ""):
+        return int(value)
+    ranks = []
+    for item in str(os.environ.get("RACER_CSD_LOCAL_RANKS", "")).split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            left, right = item.split("-", 1)
+            start = int(left.strip())
+            end = int(right.strip())
+            step = 1 if end >= start else -1
+            ranks.extend(range(start, end + step, step))
+        else:
+            ranks.append(int(item))
+    return min(ranks) if ranks else 0
+
+
+def _is_racer_csd_delete_coordinator() -> bool:
+    return _rank() == _racer_csd_delete_coordinator_rank()
+
+
 def _racer_csd_storage_options(args: Any) -> dict[str, Any]:
     socket_path = getattr(args, "racer_csd_socket_path", None)
     if socket_path:
@@ -197,6 +223,39 @@ def _write_profile_event(args: Any, event: str, report: dict[str, Any]) -> None:
     path = root / f"rank_{rank:05d}.jsonl"
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def _debug_payload_checksum_mode() -> str:
+    value = os.environ.get("RACER_DEBUG_PAYLOAD_CHECKSUM", "").strip().lower().replace("-", "_")
+    if value in {"", "0", "false", "no", "off", "disabled", "none"}:
+        return ""
+    if value in {"1", "true", "yes", "on", "fast", "sampled"}:
+        return "sample64"
+    if value in {"sample64", "sample64_v1", "sum64"}:
+        return "sample64"
+    if value in {"sha256", "strict", "strict_sha256"}:
+        return "sha256"
+    raise ValueError(f"unsupported RACER_DEBUG_PAYLOAD_CHECKSUM={value!r}")
+
+
+def _debug_payload_checksum(tensor: torch.Tensor, *, mode: str) -> str:
+    from racer.checksum import tensor_checksum  # type: ignore
+
+    return tensor_checksum(
+        tensor.detach().contiguous().view(-1),
+        buffer_size=16 * 1024 * 1024,
+        sync_device=lambda device: torch.cuda.synchronize(device) if device.type == "cuda" else None,
+        mode=mode,
+    )
+
+
+def _debug_payload_checksums(payloads: Any, *, mode: str) -> tuple[list[str], float]:
+    start = time.perf_counter()
+    checksums: list[str] = []
+    for index, buffer in enumerate(payloads.buffers):
+        valid_nbytes = int(payloads.valid_nbytes[index])
+        checksums.append(_debug_payload_checksum(buffer.narrow(0, 0, valid_nbytes), mode=mode))
+    return checksums, (time.perf_counter() - start) * 1000.0
 
 
 def capture_distributed_optimizer_state(args: Any, optimizer: Any) -> Any | None:
@@ -839,8 +898,14 @@ def _spare_worker_main(
     try:
         while True:
             key = f"racer_cmd_{seq}"
-            store.wait([key])
-            raw = store.get(key)
+            try:
+                store.wait([key])
+                raw = store.get(key)
+            except Exception as exc:
+                if exc.__class__.__name__ in {"DistNetworkError", "DistStoreError"}:
+                    print(f"[RACER] spare worker exiting after TCPStore closed: {exc}", file=sys.stderr)
+                    break
+                raise
             command = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
             op = command.get("op")
             if op == "shutdown":
@@ -914,6 +979,7 @@ def _shutdown_distributed_runtime() -> None:
     runtime = _SESSION.distributed_runtime
     if runtime is None:
         return
+    _SESSION.distributed_runtime = None
     try:
         if runtime.rank == 0:
             key = f"racer_cmd_{runtime.seq}"
@@ -923,10 +989,20 @@ def _shutdown_distributed_runtime() -> None:
                 worker.join(timeout=2.0)
     except Exception:
         pass
-    try:
-        runtime.process_group.shutdown()
-    except Exception:
-        pass
+    shutdown_pg = str(os.environ.get("RACER_DISTRIBUTED_RUNTIME_SHUTDOWN_PG", "0")).lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if shutdown_pg:
+        try:
+            runtime.process_group.shutdown()
+        except Exception:
+            pass
+    runtime.workers.clear()
+    runtime.process_group = None
+    runtime.store = None
 
 
 def _distributed_runtime(args: Any) -> _RacerDistributedRuntime:
@@ -1340,7 +1416,7 @@ def _prune_old_checkpoints(args: Any) -> None:
             _send_spare_delete_many(args, chunk_tags)
         if _racer_csd_storage_enabled(args):
             storage = _racer_chunk_storage(args)
-            if storage is not None and _rank() == 0:
+            if storage is not None and _is_racer_csd_delete_coordinator():
                 for chunk_tag in chunk_tags:
                     storage.delete(chunk_tag)
             _barrier()
@@ -1496,9 +1572,21 @@ def _distributed_store_tensor_tree(
         expected_chunk_count=expected_local_chunk_count,
     )
     payload_pack_ms_local = (time.perf_counter() - payload_pack_start) * 1000.0
+    rank = _rank()
     chunks = payload_chunks.chunks
     local_chunk_count = len(payload_chunks)
     max_chunk_count = _max_int_across_ranks(local_chunk_count, device)
+    payload_checksum_mode = _debug_payload_checksum_mode()
+    payload_checksums: list[str] = []
+    payload_checksum_ms_local = 0.0
+    if payload_checksum_mode:
+        payload_checksums, payload_checksum_ms_local = _debug_payload_checksums(payload_chunks, mode=payload_checksum_mode)
+        print(
+            "RACER payload checksum recorded: "
+            f"rank={rank}, tag={tag}, mode={payload_checksum_mode}, "
+            f"chunks={len(payload_checksums)}, ms={payload_checksum_ms_local:.2f}",
+            flush=True,
+        )
     _SESSION.tree_checkpoints[tag] = {
         "skeleton": skeleton,
         "metas": metas,
@@ -1511,6 +1599,9 @@ def _distributed_store_tensor_tree(
         "release": bool(release),
         "ckpt_type": str(ckpt_type),
     }
+    if payload_checksum_mode:
+        _SESSION.tree_checkpoints[tag]["payload_checksum_mode"] = payload_checksum_mode
+        _SESSION.tree_checkpoints[tag]["payload_checksums"] = list(payload_checksums)
     _write_tree_manifest(args, tag, _SESSION.tree_checkpoints[tag])
 
     _barrier()
@@ -1587,6 +1678,8 @@ def _distributed_store_tensor_tree(
         "ckpt_type": str(ckpt_type),
         "tensor_tree_metadata_ms_max": metadata_ms_max,
         "payload_pack_ms_max": _max_float_across_ranks(payload_pack_ms_local, device),
+        "payload_checksum_save_ms_max": _max_float_across_ranks(payload_checksum_ms_local, device),
+        "payload_checksum_chunks_local": int(len(payload_checksums)),
         "payload_pack_slot_alloc_ms_max": _max_float_across_ranks(
             float(payload_chunks.profile.get("payload_pack_slot_alloc_ms", 0.0)), device
         ),
@@ -1751,6 +1844,13 @@ def _distributed_load_tensor_tree(
     materialize_stream = torch.cuda.Stream(device=device)
     pending_payloads: list[torch.Tensor] = []
     load_tags = [_chunk_tag(tag, chunk_index) for chunk_index in range(max_chunk_count)]
+    expected_payload_checksums = [str(value) for value in list(tree.get("payload_checksums", []) or [])]
+    payload_checksum_mode = str(tree.get("payload_checksum_mode", "") or "")
+    if expected_payload_checksums and not payload_checksum_mode:
+        payload_checksum_mode = _debug_payload_checksum_mode() or "sample64"
+    payload_checksum_ms_local = 0.0
+    payload_checksum_chunks_local = 0
+    payload_checksum_mismatch_messages: list[str] = []
     if load_tags and not direct_storage_load:
         command_start = time.perf_counter()
         runtime = _send_spare_load_many(
@@ -1776,6 +1876,18 @@ def _distributed_load_tensor_tree(
         )
         load_fetch_ms_local += (time.perf_counter() - fetch_start) * 1000.0
         _accumulate_numeric_profile(racer_load_profile_local, payload_profile)
+        if payload_checksum_mode and chunk_index < len(expected_payload_checksums):
+            checksum_start = time.perf_counter()
+            actual_checksum = _debug_payload_checksum(payload, mode=payload_checksum_mode)
+            payload_checksum_ms_local += (time.perf_counter() - checksum_start) * 1000.0
+            payload_checksum_chunks_local += 1
+            expected_checksum = str(expected_payload_checksums[chunk_index])
+            if actual_checksum != expected_checksum:
+                payload_checksum_mismatch_messages.append(
+                    "chunk="
+                    f"{chunk_index}, expected={expected_checksum}, got={actual_checksum}, "
+                    f"payload_nbytes={int(payload.numel())}"
+                )
         if chunk_index < len(chunks):
             materialize_start = time.perf_counter()
             materialize_stream.wait_stream(torch.cuda.current_stream(device))
@@ -1814,6 +1926,29 @@ def _distributed_load_tensor_tree(
     tensor_scatter_sync_ms_local = (time.perf_counter() - scatter_sync_start) * 1000.0
     tensor_materialize_ms_local += tensor_scatter_sync_ms_local
     pending_payloads.clear()
+    if payload_checksum_mode and expected_payload_checksums:
+        any_checksum_mismatch = bool(payload_checksum_mismatch_messages)
+        if _distributed_initialized():
+            mismatch_tensor = torch.tensor([1 if any_checksum_mismatch else 0], dtype=torch.int32, device=device)
+            torch.distributed.all_reduce(mismatch_tensor, op=torch.distributed.ReduceOp.MAX)
+            any_checksum_mismatch = bool(int(mismatch_tensor.item()))
+        if payload_checksum_mismatch_messages:
+            raise RuntimeError(
+                "RACER payload checksum mismatch after load: "
+                f"rank={_rank()}, tag={tag}, mode={payload_checksum_mode}; "
+                + "; ".join(payload_checksum_mismatch_messages[:4])
+            )
+        if any_checksum_mismatch:
+            raise RuntimeError(
+                "RACER payload checksum mismatch after load on another rank: "
+                f"rank={_rank()}, tag={tag}, mode={payload_checksum_mode}"
+            )
+        print(
+            "RACER payload checksum verified: "
+            f"rank={_rank()}, tag={tag}, mode={payload_checksum_mode}, "
+            f"chunks={payload_checksum_chunks_local}, ms={payload_checksum_ms_local:.2f}",
+            flush=True,
+        )
     tensor_by_id: dict[int, torch.Tensor] = {}
     for tensor_id, meta in enumerate(metas):
         materialize_start = time.perf_counter()
@@ -1844,6 +1979,8 @@ def _distributed_load_tensor_tree(
         "tensor_scatter_sync_ms": tensor_scatter_sync_ms_max,
         "tree_decode_ms": tree_decode_ms_max,
         "tensor_rebuild_ms": tensor_materialize_ms_max + tree_decode_ms_max,
+        "payload_checksum_verify_ms_max": _max_float_across_ranks(payload_checksum_ms_local, device),
+        "payload_checksum_chunks_local": int(payload_checksum_chunks_local),
         "total_ms_local": load_rebuild_ms_max,
         "tensor_leaf_count_local": len(metas),
         "tensor_leaf_count_max": int(tree.get("max_leaf_count", len(metas))),
