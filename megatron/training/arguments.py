@@ -2561,7 +2561,7 @@ def _add_checkpointing_args(parser):
     group.add_argument('--racer-replacement-mapping', type=str, default=None,
                        help='Comma-separated failed:replacement entries for RACER recovery output routing.')
     group.add_argument('--racer-force-recover', action='store_true',
-                       help='Force the current live rank through the RACER recovery path during memory checkpoint load.')
+                       help='Force --racer-verify-rank (default: first train rank) through the RACER recovery path during memory checkpoint load.')
     return parser
 
 

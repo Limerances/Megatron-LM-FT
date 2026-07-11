@@ -116,6 +116,16 @@ def resolve_failed_train_ranks(
         else parse_int_list(getattr(args, "racer_recover_ranks", None), [])
     )
     if bool(getattr(args, "racer_force_recover", False)):
-        if current_rank in train and current_rank not in failed:
-            failed.append(current_rank)
+        # All ranks must use the same failed-row set for the collective decode.
+        # Selecting each process's current rank and then broadcasting rank 0's
+        # list made the option silently mean "rank 0 only". Use the explicitly
+        # configured verification rank (default: first train rank) instead.
+        del current_rank
+        forced_rank = int(getattr(args, "racer_verify_rank", train[0] if train else 0))
+        if forced_rank not in train:
+            raise ValueError(
+                f"--racer-verify-rank={forced_rank} is not in RACER train ranks {train}"
+            )
+        if forced_rank not in failed:
+            failed.append(forced_rank)
     return failed

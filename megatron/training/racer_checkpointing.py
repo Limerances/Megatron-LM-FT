@@ -32,6 +32,8 @@ DISTRIB_OPTIM_STATE_KEY = optimizer_state.DISTRIB_OPTIM_STATE_KEY
 _META_KEY = "__racer_memory_checkpoint_meta__"
 _MANIFEST_DIR = "racer_manifests"
 _TREE_MANIFEST_CSD_PREFIX = "__racer_megatron_tree_manifest__:"
+_CHECKPOINT_COMMIT_MARKER_CSD_PREFIX = "__racer_megatron_checkpoint_commit_marker__:"
+_CHECKPOINT_COMMIT_MARKER_CSD_KIND = "megatron_checkpoint_commit_marker"
 _SESSION = session_state.RacerSessionState()
 
 
@@ -574,22 +576,43 @@ def load_memory_checkpoint(
     failed_train_ranks = _resolve_failed_train_ranks(args, failed_train_ranks)
     replacement_mapping = _parse_rank_mapping(getattr(args, "racer_replacement_mapping", None))
     rank = _rank()
+    selection_error: BaseException | None = None
+    selection_error_text: str | None = None
     if rank == 0:
-        tag = _select_tag(iteration)
-        if tag is not None and not _manifest_chunks_committed(args, str(tag)):
-            raise RuntimeError(f"RACER checkpoint {tag!r} is not fully committed in CSD")
-        if tag is None:
-            tag = _select_manifest_tag(args, iteration, release)
+        try:
+            tag = _select_tag(iteration)
+            if tag is not None and not _manifest_chunks_committed(args, str(tag)):
+                raise RuntimeError(
+                    f"RACER checkpoint {tag!r} is not fully committed and resident in the rank-0 CSD"
+                )
+            if tag is None:
+                tag = _select_manifest_tag(args, iteration, release)
+        except BaseException as exc:
+            tag = None
+            selection_error = exc
+            selection_error_text = f"{type(exc).__name__}: {exc}"
     else:
         tag = None
 
     if _distributed_initialized():
-        control_box = [tag, failed_train_ranks, replacement_mapping]
+        control_box = [tag, failed_train_ranks, replacement_mapping, selection_error_text]
         torch.distributed.broadcast_object_list(control_box, src=0)
         tag = control_box[0]
         failed_train_ranks = [int(rank) for rank in control_box[1]]
         replacement_mapping = {int(k): int(v) for k, v in dict(control_box[2]).items()}
+        selection_error_text = control_box[3]
+    if selection_error_text is not None:
+        raise RuntimeError(
+            f"RACER checkpoint selection failed consistently across ranks: {selection_error_text}"
+        ) from selection_error
     found = tag is not None
+    if found and racer_distributed_store_enabled(args) and _racer_csd_storage_enabled(args):
+        unavailable_csd_nodes = _unavailable_checkpoint_csd_nodes(args, str(tag))
+        if unavailable_csd_nodes:
+            raise RuntimeError(
+                f"RACER checkpoint {tag!r} is not committed and data-resident on "
+                f"{unavailable_csd_nodes} CSD node(s)"
+            )
     loaded_iteration = _iteration_from_tag(str(tag)) if tag is not None else -1
     if not found:
         if release or (iteration is not None and int(iteration) >= 0):
@@ -811,13 +834,63 @@ def _checkpoint_commit_marker_path(args: Any, tag: str) -> Path:
     return _manifest_root(args) / f"{_manifest_filename(tag)}.committed.json"
 
 
+def _checkpoint_commit_marker_csd_tag(tag: str) -> str:
+    return f"{_CHECKPOINT_COMMIT_MARKER_CSD_PREFIX}{str(tag)}"
+
+
+def _checkpoint_commit_marker_payload(
+    tag: str,
+    iteration: int,
+    generation: str,
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "tag": str(tag),
+        "iteration": int(iteration),
+        "generation": str(generation),
+    }
+
+
+_CSD_DERIVED_METADATA_FIELDS = frozenset(
+    {
+        "backend_capabilities",
+        "checkpoint_state",
+        "committed",
+        "daemon_owned",
+        "data_resident",
+        "expected_chunks",
+        "storage_backend",
+        "total_valid_bytes",
+    }
+)
+
+
+def _csd_metadata_payload_matches(record: Any, desired: dict[str, Any]) -> bool:
+    """Compare the original metadata payload, excluding CSD-derived fields."""
+
+    if not isinstance(record, dict):
+        return False
+    payload = {
+        key: value
+        for key, value in record.items()
+        if key not in _CSD_DERIVED_METADATA_FIELDS
+    }
+    if "chunks" not in desired and payload.get("chunks") == []:
+        payload.pop("chunks")
+    return payload == dict(desired)
+
+
 def _tree_manifest(tree: dict[str, Any]) -> dict[str, Any]:
     manifest = {
         key: value
         for key, value in tree.items()
         if key not in {"source_tensors"}
     }
-    manifest["manifest_version"] = 2 if bool(manifest.get("requires_commit_marker", False)) else 1
+    if bool(manifest.get("requires_commit_marker", False)):
+        manifest["manifest_version"] = 3
+        manifest["commit_metadata_backend"] = "csd_v1"
+    else:
+        manifest["manifest_version"] = 1
     return manifest
 
 
@@ -829,18 +902,110 @@ def _write_checkpoint_commit_marker(
 ) -> None:
     path = _checkpoint_commit_marker_path(args, tag)
     path.parent.mkdir(parents=True, exist_ok=True)
-    marker = {
-        "version": 1,
-        "tag": str(tag),
-        "iteration": int(iteration),
-        "generation": str(generation),
-    }
+    marker = _checkpoint_commit_marker_payload(tag, iteration, generation)
     temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     temporary.write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
     os.replace(temporary, path)
 
 
-def _publish_tree_manifest_with_commit_marker(prepared: _PreparedDistributedSave) -> None:
+def _write_checkpoint_commit_marker_to_csd(
+    args: Any,
+    tag: str,
+    iteration: int,
+    generation: str,
+) -> bool:
+    storage = _racer_chunk_storage(args)
+    if storage is None:
+        raise RuntimeError("RACER CSD storage is unavailable for checkpoint commit marker")
+    marker = _checkpoint_commit_marker_payload(tag, iteration, generation)
+    marker.update(
+        {
+            "manifest_version": 1,
+            "racer_manifest_kind": _CHECKPOINT_COMMIT_MARKER_CSD_KIND,
+            "checkpoint_tag": str(tag),
+        }
+    )
+    csd_tag = _checkpoint_commit_marker_csd_tag(tag)
+    atomic_commit = getattr(storage, "commit_metadata", None)
+    if callable(atomic_commit):
+        try:
+            result = atomic_commit(csd_tag, marker)
+            return bool(result.get("created", True)) if isinstance(result, dict) else True
+        except Exception as exc:
+            confirmed_absent = False
+            try:
+                committed = dict(storage.get_manifest(csd_tag))
+            except KeyError:
+                committed = None
+                confirmed_absent = True
+            except Exception:
+                committed = None
+            else:
+                if _csd_metadata_payload_matches(committed, marker):
+                    # The server committed, but the create response was lost.
+                    # Treat ownership as uncertain so a failure on another CSD
+                    # cannot trigger a destructive rollback here.
+                    return False
+            if confirmed_absent:
+                try:
+                    storage.delete(csd_tag)
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"failed to atomically store RACER checkpoint commit marker in CSD for tag {tag!r}"
+            ) from exc
+
+    # Compatibility path for storage implementations that predate the
+    # metadata-only single-RPC protocol.
+    try:
+        existing = dict(storage.get_manifest(csd_tag))
+    except KeyError:
+        existing = None
+    if existing is not None:
+        if _csd_metadata_payload_matches(existing, marker):
+            return False
+        raise RuntimeError(
+            f"CSD checkpoint commit marker {csd_tag!r} already exists with different content"
+        )
+    try:
+        storage.begin(csd_tag, marker, expected_chunks=0)
+        storage.put_manifest(csd_tag, marker)
+        storage.commit(csd_tag)
+        return True
+    except Exception as exc:
+        confirmed_absent = False
+        try:
+            committed = dict(storage.get_manifest(csd_tag))
+        except KeyError:
+            committed = None
+            confirmed_absent = True
+        except Exception:
+            committed = None
+        else:
+            if _csd_metadata_payload_matches(committed, marker):
+                return False
+        if confirmed_absent:
+            # A confirmed non-committed/absent record is safe to remove. If the
+            # status RPC itself was unavailable, the branch above deliberately
+            # avoids issuing a destructive delete under uncertainty.
+            try:
+                storage.delete(csd_tag)
+            except Exception:
+                pass
+        raise RuntimeError(
+            f"failed to store RACER checkpoint commit marker in CSD for tag {tag!r}"
+        ) from exc
+
+
+def _delete_checkpoint_commit_marker_from_csd(args: Any, tag: str) -> None:
+    storage = _racer_chunk_storage(args)
+    if storage is not None:
+        storage.delete(_checkpoint_commit_marker_csd_tag(tag))
+
+
+def _publish_tree_manifest_with_commit_marker(prepared: _PreparedDistributedSave) -> dict[str, float]:
+    publish_started_at = time.perf_counter()
+    tree_manifest_started_at = time.perf_counter()
     local_manifest_error: BaseException | None = None
     try:
         _write_tree_manifest(prepared.args, prepared.tag, prepared.tree)
@@ -860,70 +1025,173 @@ def _publish_tree_manifest_with_commit_marker(prepared: _PreparedDistributedSave
             "RACER checkpoint tree-manifest publication failed on "
             f"{failed_manifest_ranks} rank(s); {detail}"
         ) from local_manifest_error
+    tree_manifest_publish_ms_local = (time.perf_counter() - tree_manifest_started_at) * 1000.0
 
-    local_marker_error: BaseException | None = None
+    generation = str(prepared.tree["checkpoint_generation"])
+    csd_marker_started_at = time.perf_counter()
+    local_csd_marker_error: BaseException | None = None
+    local_csd_marker_created = False
+    if _is_racer_csd_delete_coordinator():
+        try:
+            local_csd_marker_created = _write_checkpoint_commit_marker_to_csd(
+                prepared.args,
+                prepared.tag,
+                prepared.iteration,
+                generation,
+            )
+        except BaseException as exc:
+            local_csd_marker_error = exc
+    failed_csd_marker_ranks = _sum_int_across_ranks(
+        1 if local_csd_marker_error is not None else 0,
+        prepared.device,
+    )
+    if failed_csd_marker_ranks:
+        if _is_racer_csd_delete_coordinator() and local_csd_marker_created:
+            try:
+                _delete_checkpoint_commit_marker_from_csd(prepared.args, prepared.tag)
+            except Exception:
+                pass
+        detail = (
+            f"{type(local_csd_marker_error).__name__}: {local_csd_marker_error}"
+            if local_csd_marker_error is not None
+            else "another CSD node failed to publish the checkpoint commit marker"
+        )
+        raise RuntimeError(
+            "RACER checkpoint CSD commit-marker publication failed; "
+            f"{detail}"
+        ) from local_csd_marker_error
+    csd_marker_publish_ms_local = (time.perf_counter() - csd_marker_started_at) * 1000.0
+
+    shared_marker_started_at = time.perf_counter()
+    local_file_marker_error: BaseException | None = None
     if _rank() == 0:
         try:
             _write_checkpoint_commit_marker(
                 prepared.args,
                 prepared.tag,
                 prepared.iteration,
-                str(prepared.tree["checkpoint_generation"]),
+                generation,
             )
         except BaseException as exc:
-            local_marker_error = exc
-    failed_marker_ranks = _sum_int_across_ranks(
-        1 if local_marker_error is not None else 0,
+            local_file_marker_error = exc
+    failed_file_marker_ranks = _sum_int_across_ranks(
+        1 if local_file_marker_error is not None else 0,
         prepared.device,
     )
-    if failed_marker_ranks:
+    if failed_file_marker_ranks:
         detail = (
-            f"{type(local_marker_error).__name__}: {local_marker_error}"
-            if local_marker_error is not None
-            else "rank 0 failed to publish the checkpoint commit marker"
+            f"{type(local_file_marker_error).__name__}: {local_file_marker_error}"
+            if local_file_marker_error is not None
+            else "rank 0 failed to publish the shared checkpoint commit-marker cache"
         )
-        raise RuntimeError(
-            "RACER checkpoint commit-marker publication failed; "
-            f"{detail}"
-        ) from local_marker_error
+        _print_rank0(
+            "WARNING: RACER checkpoint is committed in every storage-bearing training CSD, but the "
+            f"shared commit-marker cache was not published; {detail}"
+        )
+    shared_marker_publish_ms_local = (time.perf_counter() - shared_marker_started_at) * 1000.0
+    return {
+        "tree_manifest_publish_ms": tree_manifest_publish_ms_local,
+        "csd_commit_marker_publish_ms": csd_marker_publish_ms_local,
+        "shared_commit_marker_cache_ms": shared_marker_publish_ms_local,
+        "checkpoint_metadata_publish_ms": (time.perf_counter() - publish_started_at) * 1000.0,
+    }
 
 
 def _write_tree_manifest(args: Any, tag: str, tree: dict[str, Any]) -> None:
     tree["source_rank"] = int(tree.get("source_rank", _rank()))
     manifest = _tree_manifest(tree)
+    csd_authoritative = _racer_csd_storage_enabled(args)
+    if csd_authoritative:
+        storage = _racer_chunk_storage(args)
+        if storage is None:
+            raise RuntimeError("RACER CSD storage is unavailable for tensor-tree manifest")
+        csd_manifest = {
+            "manifest_version": 1,
+            "racer_manifest_kind": "megatron_tensor_tree",
+            "checkpoint_tag": str(tag),
+            "source_rank": int(tree["source_rank"]),
+            "tree_pickle_b64": base64.b64encode(pickle.dumps(manifest, protocol=4)).decode("ascii"),
+        }
+        csd_tag = _tree_manifest_csd_tag(tag, int(tree["source_rank"]))
+        generation = str(manifest.get("checkpoint_generation", ""))
+        atomic_commit = getattr(storage, "commit_metadata", None)
+        if callable(atomic_commit):
+            try:
+                atomic_commit(csd_tag, csd_manifest)
+            except Exception as exc:
+                try:
+                    committed = dict(storage.get_manifest(csd_tag))
+                except Exception:
+                    committed = None
+                if not _csd_metadata_payload_matches(committed, csd_manifest):
+                    raise RuntimeError(
+                        f"failed to atomically store RACER tensor-tree manifest in CSD for tag {tag!r}"
+                    ) from exc
+        else:
+            # Compatibility path for storage implementations that predate the
+            # metadata-only single-RPC protocol.
+            try:
+                existing = dict(storage.get_manifest(csd_tag))
+            except KeyError:
+                existing = None
+            if existing is not None and not _csd_metadata_payload_matches(
+                existing, csd_manifest
+            ):
+                raise RuntimeError(
+                    f"CSD tensor-tree manifest {csd_tag!r} already exists with different content"
+                )
+            try:
+                if existing is None:
+                    storage.begin(csd_tag, csd_manifest, expected_chunks=0)
+                    storage.put_manifest(csd_tag, csd_manifest)
+                    storage.commit(csd_tag)
+            except Exception as exc:
+                try:
+                    committed = dict(storage.get_manifest(csd_tag))
+                except Exception:
+                    committed = None
+                if not _csd_metadata_payload_matches(committed, csd_manifest):
+                    raise RuntimeError(
+                        f"failed to store RACER tensor-tree manifest in CSD for tag {tag!r}"
+                    ) from exc
+
     path = _manifest_path(args, tag)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(manifest, path)
-    if not _racer_csd_storage_enabled(args):
-        return
-    storage = _racer_chunk_storage(args)
-    if storage is None:
-        return
-    csd_manifest = {
-        "manifest_version": 1,
-        "racer_manifest_kind": "megatron_tensor_tree",
-        "checkpoint_tag": str(tag),
-        "source_rank": int(tree["source_rank"]),
-        "tree_pickle_b64": base64.b64encode(pickle.dumps(manifest, protocol=4)).decode("ascii"),
-    }
-    csd_tag = _tree_manifest_csd_tag(tag, int(tree["source_rank"]))
+    temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
     try:
-        storage.begin(csd_tag, csd_manifest, expected_chunks=0)
-        storage.put_manifest(csd_tag, csd_manifest)
-        storage.commit(csd_tag)
-    except Exception as exc:
-        raise RuntimeError(f"failed to store RACER tensor-tree manifest in CSD for tag {tag!r}") from exc
+        torch.save(manifest, temporary)
+        os.replace(temporary, path)
+    except BaseException as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if not csd_authoritative:
+            raise
+        _print_rank0(
+            "WARNING: RACER tensor-tree manifest is committed in CSD, but its "
+            f"shared-file cache was not published for tag {tag!r}: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 def _load_tree_manifest(args: Any, tag: str, rank: int | None = None) -> dict[str, Any] | None:
     manifest_rank = _rank() if rank is None else int(rank)
     path = _manifest_path(args, tag, rank=manifest_rank)
-    if path.exists():
-        manifest = torch.load(path, map_location="cpu", weights_only=False)
-    else:
+    manifest = None
+    should_try_csd = bool(_SESSION.chunk_storage_clients) or bool(
+        getattr(args, "racer_csd_socket_path", None)
+        or getattr(args, "racer_csd_port", None) is not None
+    )
+    if should_try_csd:
+        # Only a confirmed missing CSD tag may fall through to an old shared
+        # manifest.  A transport/control-plane error must fail closed; otherwise
+        # a stale v2 file could bypass v3 CSD generation authority.
         manifest = _load_tree_manifest_from_csd(args, tag, manifest_rank)
-        if manifest is None:
-            return None
+    if manifest is None and path.exists():
+        manifest = torch.load(path, map_location="cpu", weights_only=False)
+    if manifest is None:
+        return None
     if not isinstance(manifest, dict):
         raise TypeError(f"RACER manifest at {path} is not a dict")
     manifest.setdefault("source_rank", int(manifest_rank))
@@ -960,16 +1228,33 @@ def _tree_manifest_available(args: Any, tag: str, rank: int = 0) -> bool:
     return _manifest_path(args, tag, rank=rank).exists() or _load_tree_manifest_from_csd(args, tag, rank) is not None
 
 
-def _checkpoint_commit_marker_available(
+def _load_checkpoint_commit_marker_from_csd(
     args: Any,
+    tag: str,
+    *,
+    strict: bool = False,
+) -> dict[str, Any] | None:
+    if not _racer_csd_storage_enabled(args):
+        return None
+    try:
+        storage = _racer_chunk_storage(args)
+        if storage is None:
+            return None
+        marker = storage.get_manifest(_checkpoint_commit_marker_csd_tag(tag))
+    except Exception:
+        if strict:
+            raise
+        # Old checkpoints have only the shared-file marker. Treat an absent or
+        # unreachable CSD marker as a cache miss so they remain loadable.
+        return None
+    return dict(marker)
+
+
+def _checkpoint_commit_marker_matches(
+    marker: Any,
     tag: str,
     expected_generation: str,
 ) -> bool:
-    path = _checkpoint_commit_marker_path(args, tag)
-    try:
-        marker = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return False
     return (
         isinstance(marker, dict)
         and str(marker.get("tag", "")) == str(tag)
@@ -977,12 +1262,47 @@ def _checkpoint_commit_marker_available(
     )
 
 
+def _checkpoint_commit_marker_available(
+    args: Any,
+    tag: str,
+    expected_generation: str,
+) -> bool:
+    csd_marker = _load_checkpoint_commit_marker_from_csd(args, tag)
+    if csd_marker is not None:
+        return (
+            csd_marker.get("racer_manifest_kind") == _CHECKPOINT_COMMIT_MARKER_CSD_KIND
+            and str(csd_marker.get("checkpoint_tag", "")) == str(tag)
+            and _checkpoint_commit_marker_matches(csd_marker, tag, expected_generation)
+        )
+
+    path = _checkpoint_commit_marker_path(args, tag)
+    try:
+        marker = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return _checkpoint_commit_marker_matches(marker, tag, expected_generation)
+
+
+def _replacement_sources_by_target(replacement_mapping: dict[int, int] | None) -> dict[int, int]:
+    """Invert source-to-target routing for source-keyed recovered payloads."""
+
+    sources_by_target: dict[int, int] = {}
+    for source_rank, target_rank in dict(replacement_mapping or {}).items():
+        source_rank = int(source_rank)
+        target_rank = int(target_rank)
+        if target_rank in sources_by_target and sources_by_target[target_rank] != source_rank:
+            raise ValueError(
+                "replacement_mapping is ambiguous: source ranks "
+                f"{sources_by_target[target_rank]} and {source_rank} both map "
+                f"to target rank {target_rank}"
+            )
+        sources_by_target[target_rank] = source_rank
+    return sources_by_target
+
+
 def _replacement_source_rank_for_current_process(replacement_mapping: dict[int, int] | None) -> int:
     rank = _rank()
-    for source_rank, replacement_rank in dict(replacement_mapping or {}).items():
-        if int(replacement_rank) == rank:
-            return int(source_rank)
-    return rank
+    return _replacement_sources_by_target(replacement_mapping).get(rank, rank)
 
 
 def _ensure_tree_checkpoint(args: Any, tag: str, rank: int | None = None) -> None:
@@ -998,22 +1318,67 @@ def _ensure_tree_checkpoint(args: Any, tag: str, rank: int | None = None) -> Non
             _SESSION.tags_by_iteration[int(iteration)] = tag
 
 
-def _manifest_chunks_committed(args: Any, tag: str) -> bool:
+def _manifest_chunks_committed(args: Any, tag: str, *, manifest_rank: int = 0) -> bool:
     if not _racer_csd_storage_enabled(args):
         return True
-    manifest = _load_tree_manifest(args, tag, rank=0)
+    manifest = _load_tree_manifest(args, tag, rank=int(manifest_rank))
     if manifest is None:
         return False
+    if str(manifest.get("commit_metadata_backend", "")) == "csd_v1":
+        generation = str(manifest.get("checkpoint_generation", ""))
+        if not generation:
+            return False
+        try:
+            csd_tree = _load_tree_manifest_from_csd(args, tag, int(manifest_rank))
+            csd_marker = _load_checkpoint_commit_marker_from_csd(args, tag, strict=True)
+        except Exception:
+            return False
+        if not (
+            isinstance(csd_tree, dict)
+            and str(csd_tree.get("commit_metadata_backend", "")) == "csd_v1"
+            and str(csd_tree.get("checkpoint_generation", "")) == generation
+            and isinstance(csd_marker, dict)
+            and csd_marker.get("racer_manifest_kind") == _CHECKPOINT_COMMIT_MARKER_CSD_KIND
+            and str(csd_marker.get("checkpoint_tag", "")) == str(tag)
+            and _checkpoint_commit_marker_matches(csd_marker, tag, generation)
+        ):
+            return False
+        manifest = csd_tree
     storage = _racer_chunk_storage(args)
     if storage is None:
         return False
     max_chunk_count = int(manifest.get("max_chunk_count", manifest.get("max_leaf_count", 0)))
     for chunk_index in range(max_chunk_count):
         try:
-            storage.get_manifest(_chunk_tag(tag, chunk_index))
-        except KeyError:
+            child_manifest = dict(storage.get_manifest(_chunk_tag(tag, chunk_index)))
+        except Exception:
+            return False
+        if not (
+            bool(child_manifest.get("committed", False))
+            and bool(child_manifest.get("daemon_owned", False))
+            and bool(child_manifest.get("data_resident", False))
+        ):
             return False
     return True
+
+
+def _unavailable_checkpoint_csd_nodes(args: Any, tag: str) -> int:
+    """Collectively count CSD coordinators that cannot serve the generation."""
+
+    local_available = True
+    if _is_racer_csd_delete_coordinator():
+        try:
+            local_available = _manifest_chunks_committed(
+                args,
+                str(tag),
+                manifest_rank=_rank(),
+            )
+        except Exception:
+            local_available = False
+    return _sum_int_across_ranks(
+        0 if local_available else 1,
+        _current_cuda_device(),
+    )
 
 
 def _manifest_tag_available(args: Any, tag: str) -> bool:
@@ -1035,12 +1400,26 @@ def _select_manifest_tag(args: Any, iteration: int | None, release: bool) -> str
         tag = _tag_for_iteration(0, True)
         if _manifest_tag_available(args, tag):
             return tag
-        return _select_manifest_tag_from_csd(args, iteration, release)
+        csd_tag = _select_manifest_tag_from_csd(args, iteration, release)
+        if csd_tag is not None:
+            return csd_tag
+        if _manifest_path(args, tag, rank=0).exists():
+            raise RuntimeError(
+                f"RACER manifest for {tag!r} exists, but the checkpoint is not committed and data-resident"
+            )
+        return None
     if iteration is not None and int(iteration) >= 0:
         tag = _tag_for_iteration(int(iteration), False)
         if _manifest_tag_available(args, tag):
             return tag
-        return _select_manifest_tag_from_csd(args, iteration, release)
+        csd_tag = _select_manifest_tag_from_csd(args, iteration, release)
+        if csd_tag is not None:
+            return csd_tag
+        if _manifest_path(args, tag, rank=0).exists():
+            raise RuntimeError(
+                f"RACER manifest for {tag!r} exists, but the checkpoint is not committed and data-resident"
+            )
+        return None
     candidates: list[tuple[int, str]] = []
     for path in root.glob("*.rank_00000.pt"):
         name = path.name
@@ -1061,6 +1440,10 @@ def _select_manifest_tag(args: Any, iteration: int | None, release: bool) -> str
     csd_tag = _select_manifest_tag_from_csd(args, iteration, release)
     if csd_tag is not None:
         return csd_tag
+    if candidates:
+        raise RuntimeError(
+            "RACER checkpoint manifests exist, but no generation is fully committed and data-resident"
+        )
     return None
 
 
@@ -1069,30 +1452,40 @@ def _select_manifest_tag_from_csd(args: Any, iteration: int | None, release: boo
         return None
     storage = _racer_chunk_storage(args)
     if storage is None:
-        return None
+        raise RuntimeError("RACER CSD storage is unavailable while selecting a checkpoint")
     try:
         raw_tags = list(storage.list_tags())
-    except Exception:
-        return None
+    except Exception as exc:
+        raise RuntimeError("failed to list RACER checkpoint metadata from CSD") from exc
     candidates: list[tuple[int, str]] = []
+    requested_candidate_seen = False
     for raw_tag in raw_tags:
         tag = _checkpoint_tag_from_tree_manifest_csd_tag(str(raw_tag), rank=0)
         if tag is None:
             continue
         if release:
-            if tag == _tag_for_iteration(0, True) and _manifest_tag_available(args, tag):
-                return tag
+            if tag == _tag_for_iteration(0, True):
+                requested_candidate_seen = True
+                if _manifest_tag_available(args, tag):
+                    return tag
             continue
         iter_value = _iteration_from_tag(tag)
         if iteration is not None and int(iteration) >= 0:
-            if iter_value == int(iteration) and _manifest_tag_available(args, tag):
-                return tag
+            if iter_value == int(iteration):
+                requested_candidate_seen = True
+                if _manifest_tag_available(args, tag):
+                    return tag
             continue
         if iter_value >= 0:
             candidates.append((iter_value, tag))
     for _, tag in sorted(candidates, reverse=True):
         if _manifest_tag_available(args, tag):
             return tag
+    if requested_candidate_seen or candidates:
+        raise RuntimeError(
+            "RACER CSD contains checkpoint metadata, but the requested generation is not fully "
+            "committed and data-resident"
+        )
     return None
 
 
@@ -1865,6 +2258,7 @@ def _prune_old_checkpoints(args: Any) -> None:
         return
 
     chunk_tags: list[str] = []
+    tree_manifest_csd_tags: list[str] = []
     for stale_tag in stale_tags:
         tree = _SESSION.tree_checkpoints.pop(stale_tag, None)
         max_chunk_count = (
@@ -1873,6 +2267,8 @@ def _prune_old_checkpoints(args: Any) -> None:
             else 0
         )
         chunk_tags.extend(_chunk_tag(stale_tag, chunk_index) for chunk_index in range(max_chunk_count))
+        manifest_rank = int(tree.get("source_rank", _rank())) if isinstance(tree, dict) else _rank()
+        tree_manifest_csd_tags.append(_tree_manifest_csd_tag(stale_tag, manifest_rank))
         _SESSION.reports.pop(stale_tag, None)
         try:
             _manifest_path(args, stale_tag).unlink(missing_ok=True)
@@ -1891,14 +2287,20 @@ def _prune_old_checkpoints(args: Any) -> None:
     if runtime is not None:
         for chunk_tag in chunk_tags:
             runtime.states.pop(chunk_tag, None)
+    csd_storage = _racer_chunk_storage(args) if _racer_csd_storage_enabled(args) else None
     if racer_distributed_store_enabled(args):
         if chunk_tags:
             _send_spare_delete_many(args, chunk_tags)
-        if _racer_csd_storage_enabled(args):
-            storage = _racer_chunk_storage(args)
-            if storage is not None and _is_racer_csd_delete_coordinator():
-                for chunk_tag in chunk_tags:
-                    storage.delete(chunk_tag)
+        if csd_storage is not None and _is_racer_csd_delete_coordinator():
+            for chunk_tag in chunk_tags:
+                try:
+                    csd_storage.delete(chunk_tag)
+                except Exception as exc:
+                    print(
+                        f"WARNING: rank {_rank()} could not prune RACER CSD chunk tag "
+                        f"{chunk_tag!r}: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
     else:
         ctx = _SESSION.local_racer_context
         if ctx is not None:
@@ -1912,6 +2314,29 @@ def _prune_old_checkpoints(args: Any) -> None:
                         pass
                 except Exception:
                     pass
+    if csd_storage is not None:
+        # Every rank owns one tree-manifest tag. This removes the correct local
+        # tag with both a shared CSD and the per-node CSD deployment.
+        for tree_manifest_csd_tag in tree_manifest_csd_tags:
+            try:
+                csd_storage.delete(tree_manifest_csd_tag)
+            except Exception as exc:
+                print(
+                    f"WARNING: rank {_rank()} could not prune RACER CSD tree manifest "
+                    f"{tree_manifest_csd_tag!r}: {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+        if _is_racer_csd_delete_coordinator():
+            for stale_tag in stale_tags:
+                marker_tag = _checkpoint_commit_marker_csd_tag(stale_tag)
+                try:
+                    csd_storage.delete(marker_tag)
+                except Exception as exc:
+                    print(
+                        f"WARNING: rank {_rank()} could not prune RACER CSD commit marker "
+                        f"{marker_tag!r}: {type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
     if os.environ.get("RACER_AGGRESSIVE_CUDA_CLEANUP", "0") == "1" and torch.cuda.is_available():
         torch.cuda.empty_cache()
     _print_rank0(
@@ -2251,6 +2676,8 @@ def _finalize_executed_distributed_store(executed: _ExecutedDistributedSave) -> 
     racer_profile_local = executed.racer_profile_local
     chunk_store_ms_values = executed.chunk_store_ms_values
     store_wall_ms_local = executed.store_wall_ms_local
+    publish_profile_local = _publish_tree_manifest_with_commit_marker(prepared)
+    checkpoint_commit_wall_ms_local = (time.perf_counter() - prepared.store_started_at) * 1000.0
     chunk_store_ms_sum_local = sum(chunk_store_ms_values)
     chunk_store_ms_max_local = max(chunk_store_ms_values, default=0.0)
     wrapper_gap_ms_local = max(
@@ -2261,6 +2688,8 @@ def _finalize_executed_distributed_store(executed: _ExecutedDistributedSave) -> 
     max_values_local = {
         "metadata_ms": metadata_ms,
         "store_wall_ms": store_wall_ms_local,
+        "checkpoint_commit_wall_ms": checkpoint_commit_wall_ms_local,
+        **publish_profile_local,
         "store_command_ms": store_command_ms_local,
         "tensor_view_ms": tensor_view_ms_local,
         "racer_calls_ms": racer_calls_ms_local,
@@ -2296,6 +2725,7 @@ def _finalize_executed_distributed_store(executed: _ExecutedDistributedSave) -> 
     max_values = _max_floats_across_ranks(max_values_local, device)
     metadata_ms_max = max_values["metadata_ms"]
     store_wall_ms_max = max_values["store_wall_ms"]
+    checkpoint_commit_wall_ms_max = max_values["checkpoint_commit_wall_ms"]
     store_command_ms_max = max_values["store_command_ms"]
     tensor_view_ms_max = max_values["tensor_view_ms"]
     racer_calls_ms_max = max_values["racer_calls_ms"]
@@ -2318,6 +2748,17 @@ def _finalize_executed_distributed_store(executed: _ExecutedDistributedSave) -> 
     encoded_store_bandwidth_gbps = (
         (float(encoded_storage_bytes_total) / 1_000_000_000.0) / store_wall_seconds
         if store_wall_seconds > 0.0
+        else 0.0
+    )
+    checkpoint_commit_wall_seconds = checkpoint_commit_wall_ms_max / 1000.0
+    logical_commit_bandwidth_gbps = (
+        (float(payload_bytes_total) / 1_000_000_000.0) / checkpoint_commit_wall_seconds
+        if checkpoint_commit_wall_seconds > 0.0
+        else 0.0
+    )
+    encoded_commit_bandwidth_gbps = (
+        (float(encoded_storage_bytes_total) / 1_000_000_000.0) / checkpoint_commit_wall_seconds
+        if checkpoint_commit_wall_seconds > 0.0
         else 0.0
     )
     copy_event_ms_max = float(racer_profile_max.get("csd_daemon_memcpy_ms_cuda_event", 0.0))
@@ -2398,6 +2839,12 @@ def _finalize_executed_distributed_store(executed: _ExecutedDistributedSave) -> 
         "racer_distributed_local_chunks_released_count_max": int(racer_profile_max.get("local_chunks_released_count", 0.0)),
         "racer_distributed_store_wall_ms_max": store_wall_ms_max,
         "racer_distributed_store_wall_ms_local": store_wall_ms_local,
+        "racer_checkpoint_commit_wall_ms_max": checkpoint_commit_wall_ms_max,
+        "racer_checkpoint_commit_wall_ms_local": checkpoint_commit_wall_ms_local,
+        "racer_tree_manifest_publish_ms_max": max_values["tree_manifest_publish_ms"],
+        "racer_csd_commit_marker_publish_ms_max": max_values["csd_commit_marker_publish_ms"],
+        "racer_shared_commit_marker_cache_ms_max": max_values["shared_commit_marker_cache_ms"],
+        "racer_checkpoint_metadata_publish_ms_max": max_values["checkpoint_metadata_publish_ms"],
         "payload_bytes_total": int(payload_bytes_total),
         "racer_encoded_storage_bytes_total": int(encoded_storage_bytes_total),
         "racer_storage_amplification": (
@@ -2407,6 +2854,8 @@ def _finalize_executed_distributed_store(executed: _ExecutedDistributedSave) -> 
         ),
         "racer_logical_store_bandwidth_gbps": logical_store_bandwidth_gbps,
         "racer_encoded_store_bandwidth_gbps": encoded_store_bandwidth_gbps,
+        "racer_logical_commit_bandwidth_gbps": logical_commit_bandwidth_gbps,
+        "racer_encoded_commit_bandwidth_gbps": encoded_commit_bandwidth_gbps,
         "racer_egm_copy_bandwidth_gbps": egm_copy_bandwidth_gbps,
         "payload_bytes_local": int(local_bytes),
         "tensor_leaf_count_local": int(local_leaf_count),
@@ -2415,11 +2864,12 @@ def _finalize_executed_distributed_store(executed: _ExecutedDistributedSave) -> 
         "racer_chunk_count_max": int(max_chunk_count),
         "racer_chunk_size": int(chunk_size),
     }
-    _publish_tree_manifest_with_commit_marker(prepared)
     _SESSION.tree_checkpoints[tag] = prepared.tree
     _print_rank0(
         "RACER distributed tensor-tree checkpoint stored: "
         f"tag={tag}, store={store_wall_ms_max:.2f} ms, "
+        f"commit_wall={checkpoint_commit_wall_ms_max:.2f} ms, "
+        f"metadata_publish={max_values['checkpoint_metadata_publish_ms']:.2f} ms, "
         f"metadata={metadata_ms_max:.2f} ms, "
         f"command={store_command_ms_max:.2f} ms, "
         f"tensor_view={tensor_view_ms_max:.2f} ms, "
@@ -3090,6 +3540,7 @@ def _distributed_load_payload(
     failed = _to_racer_pg_train_ranks(args, failed_train_ranks)
     requested = _to_racer_pg_train_ranks(args, requested_train_ranks)
     replacement = _to_racer_pg_replacement_mapping(args, replacement_mapping)
+    replacement_sources = _replacement_sources_by_target(replacement)
     if direct_storage:
         if failed or replacement:
             raise RuntimeError("direct RACER storage load is only valid when no failed ranks need recovery")
@@ -3145,11 +3596,15 @@ def _distributed_load_payload(
             replacement_mapping=replacement,
             process_group=runtime.process_group,
         )
-    rank = int(runtime.rank)
+    runtime_rank = int(runtime.rank)
+    source_rank = replacement_sources.get(runtime_rank, runtime_rank)
     try:
-        payload = result.recovered[rank].detach().contiguous()
+        payload = result.recovered[source_rank].detach().contiguous()
     except KeyError as exc:
-        raise KeyError(f"RACER distributed load did not return payload for train rank {rank}") from exc
+        raise KeyError(
+            "RACER distributed load did not return payload for "
+            f"source RACER rank {source_rank} routed to runtime RACER rank {runtime_rank}"
+        ) from exc
     if return_profile:
         return payload, dict(getattr(result, "profile", None) or {})
     return payload

@@ -90,6 +90,74 @@ def test_rank_map_module_converts_physical_failed_and_replacement_ranks():
     ) == {2: 3, 0: 1}
 
 
+def test_replacement_sources_by_target_inverts_source_to_target_mapping():
+    assert rc._replacement_sources_by_target(None) == {}
+    assert rc._replacement_sources_by_target({4: 7, 2: 4}) == {7: 4, 4: 2}
+
+
+def test_replacement_sources_by_target_rejects_ambiguous_target():
+    with pytest.raises(
+        ValueError,
+        match=r"source ranks 2 and 4 both map to target rank 7",
+    ):
+        rc._replacement_sources_by_target({2: 7, 4: 7})
+
+
+def test_force_recover_uses_same_configured_rank_on_every_process():
+    args = SimpleNamespace(
+        racer_recover_ranks=None,
+        racer_force_recover=True,
+        racer_verify_rank=3,
+    )
+
+    assert rc.rank_map.resolve_failed_train_ranks(
+        args,
+        None,
+        current_rank=0,
+        train=[0, 1, 2, 3],
+    ) == [3]
+    assert rc.rank_map.resolve_failed_train_ranks(
+        args,
+        None,
+        current_rank=2,
+        train=[0, 1, 2, 3],
+    ) == [3]
+
+
+def test_distributed_load_uses_original_source_rank_for_replacement_payload(monkeypatch):
+    monkeypatch.syspath_prepend("/mnt/data/luohaonan/workspace/racer")
+    from racer import distributed
+
+    payload = torch.arange(4, dtype=torch.uint8)
+    calls = []
+
+    def fake_distributed_load(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(recovered={1: payload}, profile={})
+
+    monkeypatch.setattr(distributed, "distributed_load", fake_distributed_load)
+    runtime = SimpleNamespace(
+        rank=2,
+        process_group=object(),
+        states={"tag": SimpleNamespace(local_chunks={"chunk": object()})},
+    )
+    monkeypatch.setattr(rc, "_distributed_runtime", lambda args: runtime)
+    args = SimpleNamespace(racer_train_ranks="2,4", racer_spare_ranks="7")
+
+    recovered = rc._distributed_load_payload(
+        args,
+        tag="tag",
+        failed_train_ranks=[4],
+        replacement_mapping={4: 7},
+        requested_train_ranks=[4],
+        send_command=False,
+    )
+
+    assert torch.equal(recovered, payload)
+    assert calls[0]["failed_train_ranks"] == [1]
+    assert calls[0]["replacement_mapping"] == {1: 2}
+
+
 def test_session_state_reset_clears_mutable_adapter_state():
     state = session_state.RacerSessionState(
         latest_tag="tag",
@@ -536,6 +604,144 @@ def test_manifest_path_is_per_rank(tmp_path, monkeypatch):
     assert path.name == "megatron__iter_0000005.rank_00003.pt"
 
 
+def test_load_tree_manifest_prefers_csd_over_stale_shared_cache(tmp_path, monkeypatch):
+    args = SimpleNamespace(racer_manifest_dir=str(tmp_path), racer_csd_port=7007)
+    tag = "megatron:iter_0000005"
+    stale = {"source_rank": 0, "checkpoint_generation": "stale"}
+    torch.save(stale, rc._manifest_path(args, tag, rank=0))
+    monkeypatch.setattr(
+        rc,
+        "_load_tree_manifest_from_csd",
+        lambda args, tag, rank: {
+            "source_rank": rank,
+            "checkpoint_generation": "current",
+        },
+    )
+
+    loaded = rc._load_tree_manifest(args, tag, rank=0)
+
+    assert loaded["checkpoint_generation"] == "current"
+
+
+def test_load_tree_manifest_fails_closed_on_csd_transport_error(tmp_path, monkeypatch):
+    args = SimpleNamespace(racer_manifest_dir=str(tmp_path), racer_csd_port=7007)
+    tag = "megatron:iter_0000005"
+    torch.save(
+        {"source_rank": 0, "checkpoint_generation": "stale-v2", "manifest_version": 2},
+        rc._manifest_path(args, tag, rank=0),
+    )
+    monkeypatch.setattr(
+        rc,
+        "_load_tree_manifest_from_csd",
+        lambda args, tag, rank: (_ for _ in ()).throw(ConnectionError("CSD unavailable")),
+    )
+
+    with pytest.raises(ConnectionError, match="CSD unavailable"):
+        rc._load_tree_manifest(args, tag, rank=0)
+
+
+def test_write_tree_manifest_shared_cache_failure_keeps_csd_authoritative(tmp_path, monkeypatch):
+    args = SimpleNamespace(racer_manifest_dir=str(tmp_path), racer_csd_port=7007)
+    events = []
+    messages = []
+
+    class FakeStorage:
+        def get_manifest(self, tag):
+            raise KeyError(tag)
+
+        def begin(self, tag, manifest, expected_chunks):
+            events.append(("begin", tag, expected_chunks))
+
+        def put_manifest(self, tag, manifest):
+            events.append(("put_manifest", tag))
+
+        def commit(self, tag):
+            events.append(("commit", tag))
+
+    monkeypatch.setattr(rc, "_racer_chunk_storage", lambda args: FakeStorage())
+    monkeypatch.setattr(rc, "_rank", lambda: 0)
+    monkeypatch.setattr(rc, "_print_rank0", messages.append)
+    monkeypatch.setattr(
+        torch,
+        "save",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("cache unavailable")),
+    )
+
+    rc._write_tree_manifest(
+        args,
+        "megatron:iter_0000005",
+        {"source_rank": 0, "checkpoint_generation": "gen-1"},
+    )
+
+    assert [event[0] for event in events] == ["begin", "put_manifest", "commit"]
+    assert len(messages) == 1
+    assert "committed in CSD" in messages[0]
+
+
+def test_write_tree_manifest_uses_atomic_metadata_commit_when_available(tmp_path, monkeypatch):
+    args = SimpleNamespace(racer_manifest_dir=str(tmp_path), racer_csd_port=7007)
+    events = []
+
+    class FakeStorage:
+        def commit_metadata(self, tag, manifest):
+            events.append((tag, dict(manifest)))
+            return {"tag": tag, "committed": True, "created": True}
+
+        def get_manifest(self, tag):
+            pytest.fail("successful atomic publication must not preflight get_manifest")
+
+        def begin(self, *args, **kwargs):
+            pytest.fail("successful atomic publication must not call begin")
+
+        def put_manifest(self, *args, **kwargs):
+            pytest.fail("successful atomic publication must not call put_manifest")
+
+        def commit(self, *args, **kwargs):
+            pytest.fail("successful atomic publication must not call legacy commit")
+
+    monkeypatch.setattr(rc, "_racer_chunk_storage", lambda args: FakeStorage())
+    monkeypatch.setattr(rc, "_rank", lambda: 2)
+
+    rc._write_tree_manifest(
+        args,
+        "megatron:iter_0000005",
+        {"source_rank": 2, "checkpoint_generation": "gen-1"},
+    )
+
+    assert len(events) == 1
+    assert events[0][0] == rc._tree_manifest_csd_tag("megatron:iter_0000005", 2)
+    assert events[0][1]["racer_manifest_kind"] == "megatron_tensor_tree"
+    assert rc._manifest_path(args, "megatron:iter_0000005", rank=2).exists()
+
+
+def test_write_tree_manifest_rejects_same_generation_different_atomic_payload(
+    tmp_path, monkeypatch
+):
+    args = SimpleNamespace(racer_manifest_dir=str(tmp_path), racer_csd_port=7007)
+
+    class FakeStorage:
+        def __init__(self):
+            self.record = None
+
+        def commit_metadata(self, tag, manifest):
+            self.record = {**dict(manifest), "unexpected_payload_field": True}
+            raise RuntimeError("same tag already committed")
+
+        def get_manifest(self, tag):
+            return dict(self.record)
+
+    storage = FakeStorage()
+    monkeypatch.setattr(rc, "_racer_chunk_storage", lambda args: storage)
+    monkeypatch.setattr(rc, "_rank", lambda: 2)
+
+    with pytest.raises(RuntimeError, match="failed to atomically store"):
+        rc._write_tree_manifest(
+            args,
+            "megatron:iter_0000005",
+            {"source_rank": 2, "checkpoint_generation": "gen-1"},
+        )
+
+
 def test_manifest_tag_requires_commit_marker_for_version_two(tmp_path, monkeypatch):
     args = SimpleNamespace(racer_manifest_dir=str(tmp_path))
     tag = "megatron:iter_0000005"
@@ -560,6 +766,305 @@ def test_manifest_tag_requires_commit_marker_for_version_two(tmp_path, monkeypat
     assert rc._manifest_tag_available(args, tag)
 
 
+@pytest.mark.parametrize(
+    "child_manifest, expected",
+    [
+        ({"committed": True, "daemon_owned": True, "data_resident": True}, True),
+        ({"committed": False, "daemon_owned": True, "data_resident": True}, False),
+        ({"committed": True, "daemon_owned": False, "data_resident": True}, False),
+        ({"committed": True, "daemon_owned": True, "data_resident": False}, False),
+    ],
+)
+def test_manifest_chunks_committed_requires_resident_daemon_owned_children(
+    child_manifest, expected, monkeypatch
+):
+    args = SimpleNamespace()
+    monkeypatch.setattr(
+        rc,
+        "_load_tree_manifest",
+        lambda args, tag, rank=0: {"max_chunk_count": 1},
+    )
+    monkeypatch.setattr(
+        rc,
+        "_racer_chunk_storage",
+        lambda args: SimpleNamespace(get_manifest=lambda tag: dict(child_manifest)),
+    )
+
+    assert rc._manifest_chunks_committed(args, "megatron:iter_0000005") is expected
+
+
+def test_manifest_v3_requires_matching_local_csd_tree_and_generation_marker(monkeypatch):
+    args = SimpleNamespace()
+    tag = "megatron:iter_0000005"
+    tree = {
+        "manifest_version": 3,
+        "commit_metadata_backend": "csd_v1",
+        "checkpoint_generation": "gen-1",
+        "max_chunk_count": 1,
+    }
+    child = {"committed": True, "daemon_owned": True, "data_resident": True}
+    marker = {
+        "racer_manifest_kind": rc._CHECKPOINT_COMMIT_MARKER_CSD_KIND,
+        "checkpoint_tag": tag,
+        "tag": tag,
+        "generation": "gen-1",
+    }
+    monkeypatch.setattr(rc, "_load_tree_manifest", lambda *args, **kwargs: dict(tree))
+    monkeypatch.setattr(rc, "_load_tree_manifest_from_csd", lambda *args, **kwargs: dict(tree))
+    monkeypatch.setattr(
+        rc,
+        "_racer_chunk_storage",
+        lambda args: SimpleNamespace(get_manifest=lambda requested_tag: dict(child)),
+    )
+    monkeypatch.setattr(
+        rc,
+        "_load_checkpoint_commit_marker_from_csd",
+        lambda *args, **kwargs: None,
+    )
+
+    assert not rc._manifest_chunks_committed(args, tag)
+
+    monkeypatch.setattr(
+        rc,
+        "_load_checkpoint_commit_marker_from_csd",
+        lambda *args, **kwargs: dict(marker),
+    )
+    assert rc._manifest_chunks_committed(args, tag)
+
+
+def test_select_manifest_tag_rejects_existing_but_unavailable_generation(tmp_path, monkeypatch):
+    args = SimpleNamespace(racer_manifest_dir=str(tmp_path))
+    tag = "megatron:iter_0000005"
+    rc._manifest_path(args, tag, rank=0).write_bytes(b"stale")
+    monkeypatch.setattr(rc, "_manifest_tag_available", lambda args, tag: False)
+    monkeypatch.setattr(rc, "_select_manifest_tag_from_csd", lambda *args, **kwargs: None)
+
+    with pytest.raises(RuntimeError, match="no generation is fully committed and data-resident"):
+        rc._select_manifest_tag(args, iteration=None, release=False)
+
+
+def test_unavailable_checkpoint_csd_nodes_checks_only_local_coordinator(monkeypatch):
+    monkeypatch.setattr(rc, "_is_racer_csd_delete_coordinator", lambda: True)
+    monkeypatch.setattr(
+        rc,
+        "_manifest_chunks_committed",
+        lambda *args, **kwargs: (_ for _ in ()).throw(ConnectionError("CSD unavailable")),
+    )
+    monkeypatch.setattr(rc, "_rank", lambda: 4)
+    monkeypatch.setattr(rc, "_current_cuda_device", lambda: torch.device("cpu"))
+    monkeypatch.setattr(rc, "_sum_int_across_ranks", lambda value, device: int(value))
+
+    assert rc._unavailable_checkpoint_csd_nodes(SimpleNamespace(), "tag") == 1
+
+
+def test_select_manifest_tag_from_csd_propagates_list_failure(monkeypatch):
+    storage = SimpleNamespace(
+        list_tags=lambda: (_ for _ in ()).throw(ConnectionError("CSD unavailable"))
+    )
+    monkeypatch.setattr(rc, "_racer_chunk_storage", lambda args: storage)
+
+    with pytest.raises(RuntimeError, match="failed to list RACER checkpoint metadata"):
+        rc._select_manifest_tag_from_csd(SimpleNamespace(), None, False)
+
+
+def test_checkpoint_commit_marker_is_committed_to_csd_without_chunks(monkeypatch):
+    events = []
+
+    class FakeStorage:
+        def get_manifest(self, tag):
+            raise KeyError(tag)
+
+        def begin(self, tag, manifest, expected_chunks):
+            events.append(("begin", tag, dict(manifest), expected_chunks))
+
+        def put_manifest(self, tag, manifest):
+            events.append(("put_manifest", tag, dict(manifest)))
+
+        def commit(self, tag):
+            events.append(("commit", tag))
+
+        def delete(self, tag):
+            events.append(("delete", tag))
+
+    monkeypatch.setattr(rc, "_racer_chunk_storage", lambda args: FakeStorage())
+
+    rc._write_checkpoint_commit_marker_to_csd(
+        SimpleNamespace(),
+        "megatron:iter_0000005",
+        5,
+        "gen-1",
+    )
+
+    csd_tag = rc._checkpoint_commit_marker_csd_tag("megatron:iter_0000005")
+    assert [event[0] for event in events] == ["begin", "put_manifest", "commit"]
+    assert events[0][1] == csd_tag
+    assert events[0][2]["racer_manifest_kind"] == rc._CHECKPOINT_COMMIT_MARKER_CSD_KIND
+    assert events[0][2]["generation"] == "gen-1"
+    assert events[0][3] == 0
+
+
+def test_checkpoint_commit_marker_uses_one_atomic_metadata_call(monkeypatch):
+    events = []
+
+    class FakeStorage:
+        def commit_metadata(self, tag, manifest):
+            events.append((tag, dict(manifest)))
+            return {"tag": tag, "committed": True, "created": True}
+
+        def get_manifest(self, tag):
+            pytest.fail("successful atomic publication must not preflight get_manifest")
+
+        def begin(self, *args, **kwargs):
+            pytest.fail("successful atomic publication must not call begin")
+
+    monkeypatch.setattr(rc, "_racer_chunk_storage", lambda args: FakeStorage())
+
+    created = rc._write_checkpoint_commit_marker_to_csd(
+        SimpleNamespace(),
+        "megatron:iter_0000005",
+        5,
+        "gen-1",
+    )
+
+    assert created is True
+    assert len(events) == 1
+    assert events[0][0] == rc._checkpoint_commit_marker_csd_tag(
+        "megatron:iter_0000005"
+    )
+    assert events[0][1]["generation"] == "gen-1"
+
+
+def test_atomic_checkpoint_marker_response_loss_accepts_committed_generation(monkeypatch):
+    tag = "megatron:iter_0000005"
+    marker = rc._checkpoint_commit_marker_payload(tag, 5, "gen-1")
+    marker.update(
+        {
+            "manifest_version": 1,
+            "racer_manifest_kind": rc._CHECKPOINT_COMMIT_MARKER_CSD_KIND,
+            "checkpoint_tag": tag,
+        }
+    )
+
+    class FakeStorage:
+        def commit_metadata(self, tag, manifest):
+            raise ConnectionError("response lost after commit")
+
+        def get_manifest(self, requested_tag):
+            return dict(marker)
+
+        def delete(self, tag):
+            pytest.fail("a confirmed committed marker must not be deleted")
+
+    monkeypatch.setattr(rc, "_racer_chunk_storage", lambda args: FakeStorage())
+
+    assert rc._write_checkpoint_commit_marker_to_csd(
+        SimpleNamespace(), tag, 5, "gen-1"
+    ) is False
+
+
+def test_atomic_checkpoint_marker_rejects_same_generation_different_payload(monkeypatch):
+    tag = "megatron:iter_0000005"
+    marker = rc._checkpoint_commit_marker_payload(tag, 4, "gen-1")
+    marker.update(
+        {
+            "manifest_version": 1,
+            "racer_manifest_kind": rc._CHECKPOINT_COMMIT_MARKER_CSD_KIND,
+            "checkpoint_tag": tag,
+        }
+    )
+
+    class FakeStorage:
+        def commit_metadata(self, tag, manifest):
+            raise RuntimeError("same tag already committed")
+
+        def get_manifest(self, requested_tag):
+            return dict(marker)
+
+        def delete(self, tag):
+            pytest.fail("a present conflicting marker must not be deleted")
+
+    monkeypatch.setattr(rc, "_racer_chunk_storage", lambda args: FakeStorage())
+
+    with pytest.raises(RuntimeError, match="failed to atomically store"):
+        rc._write_checkpoint_commit_marker_to_csd(
+            SimpleNamespace(), tag, 5, "gen-1"
+        )
+
+
+def test_checkpoint_commit_marker_retry_accepts_same_committed_generation(monkeypatch):
+    tag = "megatron:iter_0000005"
+    marker = rc._checkpoint_commit_marker_payload(tag, 5, "gen-1")
+    marker.update(
+        {
+            "manifest_version": 1,
+            "racer_manifest_kind": rc._CHECKPOINT_COMMIT_MARKER_CSD_KIND,
+            "checkpoint_tag": tag,
+        }
+    )
+    storage = SimpleNamespace(
+        get_manifest=lambda requested_tag: dict(marker),
+        begin=lambda *args, **kwargs: pytest.fail("idempotent retry must not begin again"),
+        delete=lambda *args, **kwargs: pytest.fail("valid marker must not be deleted"),
+    )
+    monkeypatch.setattr(rc, "_racer_chunk_storage", lambda args: storage)
+
+    rc._write_checkpoint_commit_marker_to_csd(SimpleNamespace(), tag, 5, "gen-1")
+
+
+def test_manifest_tag_loads_with_csd_marker_when_shared_marker_is_missing(
+    tmp_path, monkeypatch
+):
+    args = SimpleNamespace(racer_manifest_dir=str(tmp_path))
+    tag = "megatron:iter_0000005"
+    csd_marker = {
+        "racer_manifest_kind": rc._CHECKPOINT_COMMIT_MARKER_CSD_KIND,
+        "checkpoint_tag": tag,
+        "tag": tag,
+        "generation": "gen-1",
+    }
+    storage = SimpleNamespace(get_manifest=lambda requested_tag: dict(csd_marker))
+    monkeypatch.setattr(rc, "_racer_chunk_storage", lambda args: storage)
+    monkeypatch.setattr(
+        rc,
+        "_load_tree_manifest",
+        lambda args, tag, rank=0: {
+            "requires_commit_marker": True,
+            "checkpoint_generation": "gen-1",
+        },
+    )
+    monkeypatch.setattr(rc, "_manifest_chunks_committed", lambda args, tag: True)
+
+    assert not rc._checkpoint_commit_marker_path(args, tag).exists()
+    assert rc._manifest_tag_available(args, tag)
+
+
+def test_csd_marker_generation_mismatch_rejects_matching_shared_cache(
+    tmp_path, monkeypatch
+):
+    args = SimpleNamespace(racer_manifest_dir=str(tmp_path))
+    tag = "megatron:iter_0000005"
+    rc._write_checkpoint_commit_marker(args, tag, 5, "gen-1")
+    stale_csd_marker = {
+        "racer_manifest_kind": rc._CHECKPOINT_COMMIT_MARKER_CSD_KIND,
+        "checkpoint_tag": tag,
+        "tag": tag,
+        "generation": "stale-generation",
+    }
+    storage = SimpleNamespace(get_manifest=lambda requested_tag: dict(stale_csd_marker))
+    monkeypatch.setattr(rc, "_racer_chunk_storage", lambda args: storage)
+    monkeypatch.setattr(
+        rc,
+        "_load_tree_manifest",
+        lambda args, tag, rank=0: {
+            "requires_commit_marker": True,
+            "checkpoint_generation": "gen-1",
+        },
+    )
+    monkeypatch.setattr(rc, "_manifest_chunks_committed", lambda args, tag: True)
+
+    assert not rc._manifest_tag_available(args, tag)
+
+
 def test_publish_tree_manifest_writes_commit_marker_last(tmp_path, monkeypatch):
     args = SimpleNamespace(racer_manifest_dir=str(tmp_path))
     prepared = SimpleNamespace(
@@ -580,6 +1085,13 @@ def test_publish_tree_manifest_writes_commit_marker_last(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         rc,
+        "_write_checkpoint_commit_marker_to_csd",
+        lambda args, tag, iteration, generation: events.append(
+            ("csd_marker", tag, iteration, generation)
+        ),
+    )
+    monkeypatch.setattr(
+        rc,
         "_write_checkpoint_commit_marker",
         lambda args, tag, iteration, generation: events.append(
             ("marker", tag, iteration, generation)
@@ -587,13 +1099,101 @@ def test_publish_tree_manifest_writes_commit_marker_last(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(rc, "_sum_int_across_ranks", lambda value, device: int(value))
     monkeypatch.setattr(rc, "_rank", lambda: 0)
+    monkeypatch.setattr(rc, "_is_racer_csd_delete_coordinator", lambda: True)
 
     rc._publish_tree_manifest_with_commit_marker(prepared)
 
     assert events == [
         ("manifest", "megatron:iter_0000005"),
+        ("csd_marker", "megatron:iter_0000005", 5, "gen-1"),
         ("marker", "megatron:iter_0000005", 5, "gen-1"),
     ]
+
+
+def test_csd_marker_failure_never_publishes_shared_file(tmp_path, monkeypatch):
+    prepared = SimpleNamespace(
+        args=SimpleNamespace(racer_manifest_dir=str(tmp_path)),
+        tag="megatron:iter_0000005",
+        iteration=5,
+        tree={
+            "requires_commit_marker": True,
+            "checkpoint_generation": "gen-1",
+        },
+        device=torch.device("cpu"),
+    )
+    cleanup_tags = []
+    monkeypatch.setattr(rc, "_write_tree_manifest", lambda args, tag, tree: None)
+    monkeypatch.setattr(
+        rc,
+        "_write_checkpoint_commit_marker_to_csd",
+        lambda args, tag, iteration, generation: (_ for _ in ()).throw(
+            OSError("CSD write failed")
+        ),
+    )
+    monkeypatch.setattr(
+        rc,
+        "_delete_checkpoint_commit_marker_from_csd",
+        lambda args, tag: cleanup_tags.append(tag),
+    )
+    monkeypatch.setattr(
+        rc,
+        "_write_checkpoint_commit_marker",
+        lambda args, tag, iteration, generation: pytest.fail(
+            "shared marker must not be written"
+        ),
+    )
+    monkeypatch.setattr(rc, "_sum_int_across_ranks", lambda value, device: int(value))
+    monkeypatch.setattr(rc, "_rank", lambda: 0)
+    monkeypatch.setattr(rc, "_is_racer_csd_delete_coordinator", lambda: True)
+
+    with pytest.raises(RuntimeError, match="CSD commit-marker publication failed"):
+        rc._publish_tree_manifest_with_commit_marker(prepared)
+
+    assert cleanup_tags == []
+    assert not rc._checkpoint_commit_marker_path(prepared.args, prepared.tag).exists()
+
+
+def test_shared_marker_cache_failure_does_not_rollback_csd_commit(tmp_path, monkeypatch):
+    prepared = SimpleNamespace(
+        args=SimpleNamespace(racer_manifest_dir=str(tmp_path)),
+        tag="megatron:iter_0000005",
+        iteration=5,
+        tree={
+            "requires_commit_marker": True,
+            "checkpoint_generation": "gen-1",
+        },
+        device=torch.device("cpu"),
+    )
+    events = []
+    messages = []
+    monkeypatch.setattr(rc, "_write_tree_manifest", lambda args, tag, tree: events.append("manifest"))
+    monkeypatch.setattr(
+        rc,
+        "_write_checkpoint_commit_marker_to_csd",
+        lambda args, tag, iteration, generation: events.append("csd_marker"),
+    )
+    monkeypatch.setattr(
+        rc,
+        "_write_checkpoint_commit_marker",
+        lambda args, tag, iteration, generation: (_ for _ in ()).throw(
+            OSError("shared filesystem unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        rc,
+        "_delete_checkpoint_commit_marker_from_csd",
+        lambda args, tag: pytest.fail("authoritative CSD marker must not be rolled back"),
+    )
+    monkeypatch.setattr(rc, "_sum_int_across_ranks", lambda value, device: int(value))
+    monkeypatch.setattr(rc, "_rank", lambda: 0)
+    monkeypatch.setattr(rc, "_is_racer_csd_delete_coordinator", lambda: True)
+    monkeypatch.setattr(rc, "_print_rank0", messages.append)
+
+    rc._publish_tree_manifest_with_commit_marker(prepared)
+
+    assert events == ["manifest", "csd_marker"]
+    assert len(messages) == 1
+    assert "committed in every storage-bearing training CSD" in messages[0]
 
 
 def test_publish_tree_manifest_failure_never_writes_commit_marker(tmp_path, monkeypatch):
@@ -623,3 +1223,35 @@ def test_publish_tree_manifest_failure_never_writes_commit_marker(tmp_path, monk
 
     with pytest.raises(RuntimeError, match="tree-manifest publication failed"):
         rc._publish_tree_manifest_with_commit_marker(prepared)
+
+
+def test_prune_removes_shared_and_csd_checkpoint_metadata(
+    tmp_path, monkeypatch, isolated_async_session
+):
+    old_tag = "megatron:iter_0000005"
+    keep_tag = "megatron:iter_0000006"
+    args = SimpleNamespace(
+        racer_manifest_dir=str(tmp_path),
+        racer_retain_checkpoints=1,
+        racer_checkpoint=False,
+    )
+    isolated_async_session.tags_by_iteration.update({5: old_tag, 6: keep_tag})
+    isolated_async_session.tree_checkpoints.update(
+        {
+            old_tag: {"source_rank": 0, "max_chunk_count": 0},
+            keep_tag: {"source_rank": 0, "max_chunk_count": 0},
+        }
+    )
+    rc._manifest_path(args, old_tag, rank=0).write_bytes(b"manifest")
+    rc._write_checkpoint_commit_marker(args, old_tag, 5, "gen-1")
+    deleted_tags = []
+    storage = SimpleNamespace(delete=lambda tag: deleted_tags.append(tag))
+    monkeypatch.setattr(rc, "_racer_chunk_storage", lambda args: storage)
+    monkeypatch.setattr(rc, "_rank", lambda: 0)
+
+    rc._prune_old_checkpoints(args)
+
+    assert not rc._manifest_path(args, old_tag, rank=0).exists()
+    assert not rc._checkpoint_commit_marker_path(args, old_tag).exists()
+    assert rc._tree_manifest_csd_tag(old_tag, 0) in deleted_tags
+    assert rc._checkpoint_commit_marker_csd_tag(old_tag) in deleted_tags
