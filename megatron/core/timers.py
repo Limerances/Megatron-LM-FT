@@ -39,20 +39,22 @@ class TimerBase(ABC):
         self.name = name
 
     @abstractmethod
-    def start(self, barrier=False):
+    def start(self, barrier=False, sync_cuda=True):
         """Start the timer.
 
         Args:
             barrier (bool, optional): Synchronizes ranks before starting. Defaults to False.
+            sync_cuda (bool, optional): Synchronizes CUDA before starting. Defaults to True.
         """
         pass
 
     @abstractmethod
-    def stop(self, barrier=False):
+    def stop(self, barrier=False, sync_cuda=True):
         """Stop the timer.
 
         Args:
             barrier (bool, optional): Synchronizes ranks before stopping. Defaults to False.
+            sync_cuda (bool, optional): Synchronizes CUDA before stopping. Defaults to True.
         """
         pass
 
@@ -81,10 +83,10 @@ class DummyTimer(TimerBase):
     def __init__(self):
         super().__init__('dummy timer')
 
-    def start(self, barrier=False):
+    def start(self, barrier=False, sync_cuda=True):
         return
 
-    def stop(self, barrier=False):
+    def stop(self, barrier=False, sync_cuda=True):
         return
 
     def reset(self):
@@ -140,29 +142,33 @@ class Timer(TimerBase):
         """
         self._barrier_group = barrier_group
 
-    def start(self, barrier=False):
+    def start(self, barrier=False, sync_cuda=True):
         """Start the timer.
 
         Args:
             barrier (bool, optional): Synchronizes ranks before starting. Defaults to False.
+            sync_cuda (bool, optional): Synchronizes CUDA before starting. Defaults to True.
         """
         assert not self._started, 'timer has already been started'
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
-        torch.cuda.synchronize()
+        if sync_cuda:
+            torch.cuda.synchronize()
         self._start_time = time.time()
         self._started = True
 
-    def stop(self, barrier=False):
+    def stop(self, barrier=False, sync_cuda=True):
         """Stop the timer.
 
         Args:
             barrier (bool, optional): Synchronizes ranks before stopping. Defaults to False.
+            sync_cuda (bool, optional): Synchronizes CUDA before stopping. Defaults to True.
         """
         assert self._started, 'timer is not started'
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
-        torch.cuda.synchronize()
+        if sync_cuda:
+            torch.cuda.synchronize()
         elapsed = time.time() - self._start_time
         self._elapsed += elapsed
         self._active_time += elapsed

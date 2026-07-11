@@ -150,6 +150,8 @@ class PinnedPayloadBufferPool:
     def __init__(self) -> None:
         self.chunk_size = 0
         self.buffers: list[torch.Tensor] = []
+        self.cuda_load_slots: dict[str, list[torch.Tensor]] = {}
+        self.cuda_load_slot_sizes: dict[str, int] = {}
         self.last_ensure_profile: dict[str, float] = {}
 
     def ensure(self, *, chunk_size: int, chunk_count: int) -> list[torch.Tensor]:
@@ -177,8 +179,68 @@ class PinnedPayloadBufferPool:
         }
         return self.buffers[:chunk_count]
 
-    def prewarm(self, *, chunk_size: int, chunk_count: int) -> dict[str, float]:
-        self.ensure(chunk_size=chunk_size, chunk_count=chunk_count)
+    def ensure_cuda_load_slots(
+        self,
+        *,
+        device: torch.device,
+        chunk_size: int,
+        slot_count: int,
+    ) -> dict[int, torch.Tensor]:
+        """Keep the batched pinned-to-device slots alive across checkpoints."""
+
+        import time
+
+        chunk_size = max(1, int(chunk_size))
+        slot_count = max(0, int(slot_count))
+        device = torch.device(device)
+        device_key = str(device)
+        start = time.perf_counter()
+        if self.cuda_load_slot_sizes.get(device_key) != chunk_size:
+            self.cuda_load_slots[device_key] = []
+            self.cuda_load_slot_sizes[device_key] = chunk_size
+        slots = self.cuda_load_slots.setdefault(device_key, [])
+        reused = min(len(slots), slot_count)
+        allocated = 0
+        while len(slots) < slot_count:
+            slots.append(torch.empty(chunk_size, dtype=torch.uint8, device=device))
+            allocated += 1
+        self.last_ensure_profile.update(
+            {
+                "payload_cuda_slot_ensure_ms": float(
+                    (time.perf_counter() - start) * 1000.0
+                ),
+                "payload_cuda_slot_allocated": float(allocated),
+                "payload_cuda_slot_reused": float(reused),
+                "payload_cuda_slot_count": float(len(slots)),
+                "payload_cuda_slot_reserved_nbytes": float(len(slots) * chunk_size),
+            }
+        )
+        return {index: tensor for index, tensor in enumerate(slots[:slot_count])}
+
+    def prewarm(
+        self,
+        *,
+        chunk_size: int,
+        chunk_count: int,
+        device: torch.device | None = None,
+    ) -> dict[str, float]:
+        buffers = self.ensure(chunk_size=chunk_size, chunk_count=chunk_count)
+        if device is not None:
+            slots = self.ensure_cuda_load_slots(
+                device=device,
+                chunk_size=chunk_size,
+                slot_count=chunk_count,
+            )
+            if torch.device(device).type == "cuda" and slots:
+                import time
+
+                warmup_start = time.perf_counter()
+                for index, host in enumerate(buffers):
+                    slots[index].copy_(host, non_blocking=True)
+                torch.cuda.synchronize(device)
+                self.last_ensure_profile["payload_cuda_slot_warmup_ms"] = float(
+                    (time.perf_counter() - warmup_start) * 1000.0
+                )
         return dict(self.last_ensure_profile)
 
 
@@ -255,6 +317,15 @@ def pack_tensor_chunks_to_pinned(
         host_buffer_pool.ensure(chunk_size=chunk_size, chunk_count=int(expected_chunk_count))
         if host_buffer_pool is not None
         else []
+    )
+    shared_load_slots = (
+        host_buffer_pool.ensure_cuda_load_slots(
+            device=device,
+            chunk_size=chunk_size,
+            slot_count=int(expected_chunk_count),
+        )
+        if host_buffer_pool is not None
+        else {}
     )
     pool_profile = dict(getattr(host_buffer_pool, "last_ensure_profile", {}) or {})
     buffers: list[torch.Tensor] = []
@@ -382,6 +453,7 @@ def pack_tensor_chunks_to_pinned(
             **pool_profile,
         },
         _ready_events=ready_events,
+        _load_slots=shared_load_slots,
     )
 
 

@@ -64,6 +64,13 @@ def maybe_finalize_async_save(blocking: bool = False, terminate=False):
                 be closed as the last action of this function.
     """
     args = get_args()
+    if bool(getattr(args, "racer_checkpoint", False)) and bool(
+        getattr(args, "racer_async_offload", False)
+    ):
+        # Lazy import avoids a module cycle through checkpointing.py.
+        from megatron.training import racer_checkpointing
+
+        racer_checkpointing.maybe_finalize_async_saves(blocking=blocking, terminate=terminate)
     if not args.async_save:
         return
 

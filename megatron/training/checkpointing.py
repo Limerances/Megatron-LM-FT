@@ -477,13 +477,46 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
                  f"from iteration {iteration:7d}")
 
 
-def _racer_max_ms(value_ms: float) -> float:
-    if not torch.distributed.is_initialized():
-        return float(value_ms)
-    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-    tensor = torch.tensor([float(value_ms)], dtype=torch.float64, device=device)
-    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
-    return float(tensor.item())
+def _racer_reduce_blocking_profile(profile: dict[str, float]) -> None:
+    """Optionally reduce checkpoint blocking metrics with one collective.
+
+    These measurements used to issue one default-process-group all-reduce per
+    field.  Besides distorting the value being measured, six synchronization
+    points added hundreds of milliseconds to every RACER save.  Performance
+    runs keep rank-local measurements by default so instrumentation does not
+    add a synchronization point.  ``RACER_BLOCKING_PROFILE_GLOBAL_MAX=1``
+    enables one packed reduction when a cross-rank MAX is explicitly needed.
+    """
+
+    keys = (
+        "pre_state_ms",
+        "optimizer_capture_ms",
+        "state_dict_ms",
+        "racer_adapter_save_ms",
+        "finalize_ms",
+        "save_checkpoint_fn_total_ms",
+    )
+    reduce_global_max = os.environ.get(
+        "RACER_BLOCKING_PROFILE_GLOBAL_MAX", "0"
+    ).lower() in {"1", "true", "yes", "on"}
+    if not torch.distributed.is_initialized() or not reduce_global_max:
+        for key in keys:
+            profile[key] = float(profile.get(key, 0.0))
+        return
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
+    values = torch.tensor(
+        [float(profile.get(key, 0.0)) for key in keys],
+        dtype=torch.float64,
+        device=device,
+    )
+    torch.distributed.all_reduce(values, op=torch.distributed.ReduceOp.MAX)
+    reduced = values.cpu().tolist()
+    for key, value in zip(keys, reduced):
+        profile[key] = float(value)
 
 
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
@@ -508,13 +541,14 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     """
     start_ckpt = time()
     args = get_args()
+    racer_async_offload = racer_checkpointing.racer_async_offload_enabled(args)
     racer_profile = {} if racer_checkpointing.racer_checkpoint_enabled(args) else None
 
     if args.async_save and not is_empty_async_queue():
         print_rank_0('WARNING: Starting a checkpoint save before previous has finished. Consider increasing the checkpoint interval.')
 
     # Prepare E2E metrics at start of save checkpoint
-    productive_metrics = on_save_checkpoint_start(args.async_save)
+    productive_metrics = on_save_checkpoint_start(bool(args.async_save or racer_async_offload))
 
     # Monitor for the checkpointing timeout (no-op if FT is not enabled)
     ft_integration.on_checkpointing_start()
@@ -573,7 +607,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # Save dataloader state if the dataloader supports it (currently only Megatron Energon).
     maybe_save_dataloader_state(train_data_iterator, iteration, getattr(args, "dataloader_save", None))
     if racer_profile is not None:
-        racer_profile["pre_state_ms"] = _racer_max_ms((time() - pre_state_start) * 1000.0)
+        racer_profile["pre_state_ms"] = (time() - pre_state_start) * 1000.0
 
     racer_distributed_optimizer_state = None
 
@@ -590,7 +624,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 args, optimizer
             )
             if racer_profile is not None:
-                racer_profile["optimizer_capture_ms"] = _racer_max_ms((time() - optimizer_capture_start) * 1000.0)
+                racer_profile["optimizer_capture_ms"] = (time() - optimizer_capture_start) * 1000.0
         else:
             optim_checkpoint_name = \
                 get_distributed_optimizer_checkpoint_name(checkpoint_name)
@@ -646,7 +680,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             rerun_state=rerun_state,
         )
         if racer_profile is not None:
-            racer_profile["state_dict_ms"] = _racer_max_ms((time() - state_dict_start) * 1000.0)
+            racer_profile["state_dict_ms"] = (time() - state_dict_start) * 1000.0
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if racer_checkpointing.racer_checkpoint_enabled(args):
@@ -665,7 +699,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 ),
             )
             if racer_profile is not None:
-                racer_profile["racer_adapter_save_ms"] = _racer_max_ms((time() - racer_save_start) * 1000.0)
+                racer_profile["racer_adapter_save_ms"] = (time() - racer_save_start) * 1000.0
         elif ckpt_type == CheckpointType.GLOBAL and ckpt_format == "torch_dist":
             if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
                 # TODO Handle non-empty directories (e.g., after a crash during saving).
@@ -767,7 +801,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 torch.save(state_dict, checkpoint_name)
     start_misc = time()
     if ckpt_type != CheckpointType.LOCAL:
-        if not args.async_save:
+        if not args.async_save and not racer_async_offload:
             assert async_save_request is None
             # Wait so everyone is done (necessary)
             if torch.distributed.is_initialized():
@@ -845,7 +879,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         if args.async_save:
             assert async_save_request is not None
             async_save_request.add_finalize_fn(iter_finalize_fn)
-        else:
+        elif not racer_async_offload:
             iter_finalize_fn()
 
     # Additional callback for one_logger (last rank)
@@ -856,7 +890,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
         if args.async_save:
             assert async_save_request is not None
             async_save_request.add_finalize_fn(onelogger_finalize_fn)
-        else:
+        elif not racer_async_offload:
             onelogger_finalize_fn()
 
     # Additional callback for wandb (last rank)
@@ -877,14 +911,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                      f"an async checkpoint save at iteration {iteration:7d} to {save_dir}")
 
     # Wait so everyone is done (not necessary)
-    if torch.distributed.is_initialized():
+    if torch.distributed.is_initialized() and not racer_async_offload:
         torch.distributed.barrier()
 
     end_misc = time()
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
     if racer_profile is not None:
-        racer_profile["finalize_ms"] = _racer_max_ms((end_misc - start_misc) * 1000.0)
-        racer_profile["save_checkpoint_fn_total_ms"] = _racer_max_ms((end_misc - start_ckpt) * 1000.0)
+        racer_profile["finalize_ms"] = (end_misc - start_misc) * 1000.0
+        racer_profile["save_checkpoint_fn_total_ms"] = (end_misc - start_ckpt) * 1000.0
+        _racer_reduce_blocking_profile(racer_profile)
         print_rank_0(
             "RACER checkpoint blocking profile: "
             f"iteration={int(iteration)}, "

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import atexit
 import base64
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 import json
 import multiprocessing as mp
 import os
@@ -33,10 +35,69 @@ _TREE_MANIFEST_CSD_PREFIX = "__racer_megatron_tree_manifest__:"
 _SESSION = session_state.RacerSessionState()
 
 
+@dataclass
+class _PreparedDistributedSave:
+    args: Any
+    tag: str
+    iteration: int
+    release: bool
+    ckpt_type: str
+    device: torch.device
+    tree: dict[str, Any]
+    payload_chunks: Any
+    packet_sizes_by_tag: dict[str, dict[int, int]]
+    chunk_tags: list[str]
+    runtime: Any
+    chunk_storage: Any
+    metadata_ms_local: float
+    payload_pack_ms_local: float
+    payload_checksum_ms_local: float
+    payload_checksums: list[str]
+    local_leaf_count: int
+    max_leaf_count: int
+    local_bytes: int
+    payload_bytes_total: int
+    local_chunk_count: int
+    max_chunk_count: int
+    chunk_size: int
+    store_command_ms_local: float
+    distributed_store_handle: Any
+    spare_completion_key: str | None
+    tensor_view_ms_local: float
+    racer_prepare_ms_local: float
+    store_started_at: float
+
+
+@dataclass
+class _ExecutedDistributedSave:
+    prepared: _PreparedDistributedSave
+    tensor_view_ms_local: float
+    racer_calls_ms_local: float
+    racer_profile_local: dict[str, float]
+    chunk_store_ms_values: list[float]
+    store_wall_ms_local: float
+
+
+@dataclass
+class _PendingAsyncSave:
+    prepared: _PreparedDistributedSave
+    future: Future
+    scheduled_at: float
+
+
 def _payload_buffer_pool() -> Any:
     if _SESSION.payload_buffer_pool is None:
         _SESSION.payload_buffer_pool = tensor_tree.PinnedPayloadBufferPool()
     return _SESSION.payload_buffer_pool
+
+
+def _racer_launch_stream(device: torch.device) -> torch.cuda.Stream:
+    device_index = int(device.index if device.index is not None else torch.cuda.current_device())
+    stream = _SESSION.launch_streams.get(device_index)
+    if stream is None:
+        stream = torch.cuda.Stream(device=device)
+        _SESSION.launch_streams[device_index] = stream
+    return stream
 
 
 def _prewarm_payload_buffer_pool_from_tree(tree: dict[str, Any] | None) -> dict[str, float]:
@@ -46,7 +107,13 @@ def _prewarm_payload_buffer_pool_from_tree(tree: dict[str, Any] | None) -> dict[
     chunk_count = len(list(tree.get("chunks", []) or []))
     if chunk_size <= 0 or chunk_count <= 0:
         return {}
-    return dict(_payload_buffer_pool().prewarm(chunk_size=chunk_size, chunk_count=chunk_count))
+    return dict(
+        _payload_buffer_pool().prewarm(
+            chunk_size=chunk_size,
+            chunk_count=chunk_count,
+            device=_current_cuda_device(),
+        )
+    )
 
 
 def racer_checkpoint_enabled(args: Any) -> bool:
@@ -55,6 +122,13 @@ def racer_checkpoint_enabled(args: Any) -> bool:
 
 def racer_distributed_store_enabled(args: Any) -> bool:
     return racer_checkpoint_enabled(args) and bool(getattr(args, "racer_distributed_store", False))
+
+
+def racer_async_offload_enabled(args: Any) -> bool:
+    return (
+        racer_distributed_store_enabled(args)
+        and bool(getattr(args, "racer_async_offload", False))
+    )
 
 
 _CSD_STORAGE_BACKENDS = {
@@ -267,6 +341,137 @@ def capture_distributed_optimizer_state(args: Any, optimizer: Any) -> Any | None
     )
 
 
+def _publish_completed_save(args: Any, prepared: _PreparedDistributedSave, report: dict[str, Any]) -> None:
+    tag = prepared.tag
+    iteration = prepared.iteration
+    _SESSION.latest_tag = tag
+    _SESSION.tags_by_iteration[int(iteration)] = tag
+    _SESSION.reports[tag] = report
+    _write_profile_event(args, "save", report)
+    _prune_old_checkpoints(args)
+
+
+def _async_save_executor() -> ThreadPoolExecutor:
+    executor = _SESSION.async_save_executor
+    if executor is None:
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="racer-checkpoint-save")
+        _SESSION.async_save_executor = executor
+    return executor
+
+
+def _submit_prepared_distributed_save(prepared: _PreparedDistributedSave) -> dict[str, Any]:
+    if _SESSION.pending_async_save is not None:
+        raise RuntimeError("RACER async save queue already has an in-flight checkpoint")
+    scheduled_at = time.perf_counter()
+    future = _async_save_executor().submit(_execute_prepared_distributed_store, prepared)
+    _SESSION.pending_async_save = _PendingAsyncSave(
+        prepared=prepared,
+        future=future,
+        scheduled_at=scheduled_at,
+    )
+    report = {
+        "tag": prepared.tag,
+        "iteration": int(prepared.iteration),
+        "release": bool(prepared.release),
+        "ckpt_type": str(prepared.ckpt_type),
+        "async_scheduled": True,
+        "payload_bytes_total": int(prepared.payload_bytes_total),
+        "payload_bytes_local": int(prepared.local_bytes),
+        "racer_chunk_count_local": int(prepared.local_chunk_count),
+        "racer_chunk_count_max": int(prepared.max_chunk_count),
+    }
+    _print_rank0(
+        "RACER async checkpoint scheduled: "
+        f"iteration={prepared.iteration}, tag={prepared.tag}, "
+        f"bytes={prepared.payload_bytes_total}, chunks={prepared.max_chunk_count}"
+    )
+    return report
+
+
+def _async_future_status(future: Future) -> tuple[bool, BaseException | None, bool]:
+    """Return all-rank completion/error state with one packed reduction.
+
+    Error is checked even when another rank is still running.  The previous
+    done-MIN-then-error-SUM sequence could hide an early worker failure forever
+    when a peer subsequently stalled in runtime P2P or CSD wait.
+    """
+
+    local_done = bool(future.done())
+    local_error: BaseException | None = None
+    if local_done:
+        try:
+            local_error = future.exception()
+        except BaseException as exc:
+            local_error = exc
+    if not _distributed_initialized():
+        return local_done, local_error, local_error is not None
+
+    status = torch.tensor(
+        [1 if local_error is not None else 0, 0 if local_done else 1],
+        dtype=torch.int32,
+        device=_current_cuda_device(),
+    )
+    torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MAX)
+    any_error, any_incomplete = [int(value) for value in status.cpu().tolist()]
+    return not bool(any_incomplete), local_error, bool(any_error)
+
+
+def maybe_finalize_async_saves(blocking: bool = False, terminate: bool = False) -> bool:
+    del terminate  # The executor is reusable because Megatron may schedule a final save after train().
+    pending = _SESSION.pending_async_save
+    if pending is None:
+        return False
+
+    while True:
+        all_done, local_error, any_error = _async_future_status(pending.future)
+        if any_error:
+            break
+        if all_done:
+            break
+        if not blocking:
+            return False
+        time.sleep(0.01)
+
+    if any_error:
+        local_detail = (
+            f"{type(local_error).__name__}: {local_error}"
+            if local_error is not None
+            else "the local worker completed, but another rank's worker failed"
+        )
+        raise RuntimeError(
+            "RACER async checkpoint failed before default-process-group finalization on "
+            f"one or more ranks; {local_detail}"
+        ) from local_error
+
+    executed = pending.future.result()
+
+    report = _finalize_executed_distributed_store(executed)
+    commit_wall_ms_local = (time.perf_counter() - pending.scheduled_at) * 1000.0
+    report["racer_async_commit_wall_ms_max"] = _max_float_across_ranks(
+        commit_wall_ms_local,
+        pending.prepared.device,
+    )
+    commit_wall_ms = float(report["racer_async_commit_wall_ms_max"])
+    if commit_wall_ms > 0.0:
+        report["racer_async_logical_commit_bandwidth_gbps"] = (
+            float(report.get("payload_bytes_total", 0)) / 1_000_000_000.0
+        ) / (commit_wall_ms / 1000.0)
+        report["racer_async_encoded_commit_bandwidth_gbps"] = (
+            float(report.get("racer_encoded_storage_bytes_total", 0)) / 1_000_000_000.0
+        ) / (commit_wall_ms / 1000.0)
+    else:
+        report["racer_async_logical_commit_bandwidth_gbps"] = 0.0
+        report["racer_async_encoded_commit_bandwidth_gbps"] = 0.0
+    _SESSION.pending_async_save = None
+    _publish_completed_save(pending.prepared.args, pending.prepared, report)
+    _print_rank0(
+        "RACER async checkpoint committed: "
+        f"iteration={pending.prepared.iteration}, tag={pending.prepared.tag}, "
+        f"commit_wall={float(report['racer_async_commit_wall_ms_max']):.2f} ms"
+    )
+    return True
+
+
 def save_memory_checkpoint(
     args: Any,
     *,
@@ -281,6 +486,14 @@ def save_memory_checkpoint(
 
     if not racer_checkpoint_enabled(args):
         return None
+
+    async_offload = racer_async_offload_enabled(args)
+    if async_offload:
+        if bool(getattr(args, "racer_verify_on_save", False)):
+            raise RuntimeError("--racer-verify-on-save is not supported with --racer-async-offload")
+        # The current pinned arena is single-generation. Backpressure here is normally
+        # a no-op at save_interval>1, and prevents overwriting an in-flight snapshot.
+        maybe_finalize_async_saves(blocking=True)
 
     rank = _rank()
     tag = _tag_for_iteration(iteration, release)
@@ -301,15 +514,28 @@ def save_memory_checkpoint(
     device = _current_cuda_device()
 
     if racer_distributed_store_enabled(args):
-        report = _distributed_store_tensor_tree(
-            args,
-            tag=tag,
-            iteration=iteration,
-            release=release,
-            ckpt_type=ckpt_type,
-            state_for_save=state_for_save,
-            device=device,
-        )
+        if async_offload:
+            prepared = _prepare_distributed_store_tensor_tree(
+                args,
+                tag=tag,
+                iteration=iteration,
+                release=release,
+                ckpt_type=ckpt_type,
+                state_for_save=state_for_save,
+                device=device,
+            )
+            prepared.tree.pop("source_tensors", None)
+            return _submit_prepared_distributed_save(prepared)
+        else:
+            report = _distributed_store_tensor_tree(
+                args,
+                tag=tag,
+                iteration=iteration,
+                release=release,
+                ckpt_type=ckpt_type,
+                state_for_save=state_for_save,
+                device=device,
+            )
     else:
         report = _local_store_tensor_tree(
             args,
@@ -343,6 +569,8 @@ def load_memory_checkpoint(
 
     if not racer_checkpoint_enabled(args):
         return None
+    if racer_async_offload_enabled(args):
+        maybe_finalize_async_saves(blocking=True)
     failed_train_ranks = _resolve_failed_train_ranks(args, failed_train_ranks)
     replacement_mapping = _parse_rank_mapping(getattr(args, "racer_replacement_mapping", None))
     rank = _rank()
@@ -378,7 +606,9 @@ def load_memory_checkpoint(
                 f"staging={float(prewarm.get('staging_ms', 0.0)):.2f} ms, "
                 f"staging_slabs={int(prewarm.get('staging_slabs', 0.0))}, "
                 f"payload_pool={float(prewarm.get('payload_pool_ms', 0.0)):.2f} ms, "
-                f"payload_chunks={int(prewarm.get('payload_pool_chunks', 0.0))}"
+                f"payload_chunks={int(prewarm.get('payload_pool_chunks', 0.0))}, "
+                f"payload_cuda_slots={int(prewarm.get('payload_cuda_slots', 0.0))}, "
+                f"store_path={float(prewarm.get('store_path_ms', 0.0)):.2f} ms"
             )
         return None
 
@@ -470,6 +700,8 @@ def verify_memory_checkpoint(
 ) -> None:
     """Read this rank from RACER memory and compare the raw CUDA payload."""
 
+    if racer_async_offload_enabled(args):
+        maybe_finalize_async_saves(blocking=True)
     rank = _rank()
     tag = _tag_for_iteration(iteration, release)
     _ensure_tree_checkpoint(args, tag)
@@ -575,14 +807,85 @@ def _manifest_path(args: Any, tag: str, rank: int | None = None) -> Path:
     return _manifest_root(args) / f"{_manifest_filename(tag)}.rank_{manifest_rank:05d}.pt"
 
 
+def _checkpoint_commit_marker_path(args: Any, tag: str) -> Path:
+    return _manifest_root(args) / f"{_manifest_filename(tag)}.committed.json"
+
+
 def _tree_manifest(tree: dict[str, Any]) -> dict[str, Any]:
     manifest = {
         key: value
         for key, value in tree.items()
         if key not in {"source_tensors"}
     }
-    manifest["manifest_version"] = 1
+    manifest["manifest_version"] = 2 if bool(manifest.get("requires_commit_marker", False)) else 1
     return manifest
+
+
+def _write_checkpoint_commit_marker(
+    args: Any,
+    tag: str,
+    iteration: int,
+    generation: str,
+) -> None:
+    path = _checkpoint_commit_marker_path(args, tag)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    marker = {
+        "version": 1,
+        "tag": str(tag),
+        "iteration": int(iteration),
+        "generation": str(generation),
+    }
+    temporary = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _publish_tree_manifest_with_commit_marker(prepared: _PreparedDistributedSave) -> None:
+    local_manifest_error: BaseException | None = None
+    try:
+        _write_tree_manifest(prepared.args, prepared.tag, prepared.tree)
+    except BaseException as exc:
+        local_manifest_error = exc
+    failed_manifest_ranks = _sum_int_across_ranks(
+        1 if local_manifest_error is not None else 0,
+        prepared.device,
+    )
+    if failed_manifest_ranks:
+        detail = (
+            f"{type(local_manifest_error).__name__}: {local_manifest_error}"
+            if local_manifest_error is not None
+            else "another rank failed to publish its tree manifest"
+        )
+        raise RuntimeError(
+            "RACER checkpoint tree-manifest publication failed on "
+            f"{failed_manifest_ranks} rank(s); {detail}"
+        ) from local_manifest_error
+
+    local_marker_error: BaseException | None = None
+    if _rank() == 0:
+        try:
+            _write_checkpoint_commit_marker(
+                prepared.args,
+                prepared.tag,
+                prepared.iteration,
+                str(prepared.tree["checkpoint_generation"]),
+            )
+        except BaseException as exc:
+            local_marker_error = exc
+    failed_marker_ranks = _sum_int_across_ranks(
+        1 if local_marker_error is not None else 0,
+        prepared.device,
+    )
+    if failed_marker_ranks:
+        detail = (
+            f"{type(local_marker_error).__name__}: {local_marker_error}"
+            if local_marker_error is not None
+            else "rank 0 failed to publish the checkpoint commit marker"
+        )
+        raise RuntimeError(
+            "RACER checkpoint commit-marker publication failed; "
+            f"{detail}"
+        ) from local_marker_error
 
 
 def _write_tree_manifest(args: Any, tag: str, tree: dict[str, Any]) -> None:
@@ -657,6 +960,23 @@ def _tree_manifest_available(args: Any, tag: str, rank: int = 0) -> bool:
     return _manifest_path(args, tag, rank=rank).exists() or _load_tree_manifest_from_csd(args, tag, rank) is not None
 
 
+def _checkpoint_commit_marker_available(
+    args: Any,
+    tag: str,
+    expected_generation: str,
+) -> bool:
+    path = _checkpoint_commit_marker_path(args, tag)
+    try:
+        marker = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return False
+    return (
+        isinstance(marker, dict)
+        and str(marker.get("tag", "")) == str(tag)
+        and str(marker.get("generation", "")) == str(expected_generation)
+    )
+
+
 def _replacement_source_rank_for_current_process(replacement_mapping: dict[int, int] | None) -> int:
     rank = _rank()
     for source_rank, replacement_rank in dict(replacement_mapping or {}).items():
@@ -697,7 +1017,14 @@ def _manifest_chunks_committed(args: Any, tag: str) -> bool:
 
 
 def _manifest_tag_available(args: Any, tag: str) -> bool:
-    return _tree_manifest_available(args, tag, rank=0) and _manifest_chunks_committed(args, tag)
+    manifest = _load_tree_manifest(args, tag, rank=0)
+    if manifest is None:
+        return False
+    if bool(manifest.get("requires_commit_marker", False)):
+        generation = str(manifest.get("checkpoint_generation", ""))
+        if not generation or not _checkpoint_commit_marker_available(args, tag, generation):
+            return False
+    return _manifest_chunks_committed(args, tag)
 
 
 def _select_manifest_tag(args: Any, iteration: int | None, release: bool) -> str | None:
@@ -729,7 +1056,7 @@ def _select_manifest_tag(args: Any, iteration: int | None, release: bool) -> str
             return release_tag
         return _select_manifest_tag_from_csd(args, iteration, release)
     for _, tag in sorted(candidates, reverse=True):
-        if _manifest_chunks_committed(args, tag):
+        if _manifest_tag_available(args, tag):
             return tag
     csd_tag = _select_manifest_tag_from_csd(args, iteration, release)
     if csd_tag is not None:
@@ -753,31 +1080,42 @@ def _select_manifest_tag_from_csd(args: Any, iteration: int | None, release: boo
         if tag is None:
             continue
         if release:
-            if tag == _tag_for_iteration(0, True) and _manifest_chunks_committed(args, tag):
+            if tag == _tag_for_iteration(0, True) and _manifest_tag_available(args, tag):
                 return tag
             continue
         iter_value = _iteration_from_tag(tag)
         if iteration is not None and int(iteration) >= 0:
-            if iter_value == int(iteration) and _manifest_chunks_committed(args, tag):
+            if iter_value == int(iteration) and _manifest_tag_available(args, tag):
                 return tag
             continue
         if iter_value >= 0:
             candidates.append((iter_value, tag))
     for _, tag in sorted(candidates, reverse=True):
-        if _manifest_chunks_committed(args, tag):
+        if _manifest_tag_available(args, tag):
             return tag
     return None
 
 
 class _RacerDistributedRuntime:
-    def __init__(self, *, store: Any, process_group: Any, workers: list[Any], rank: int) -> None:
+    def __init__(
+        self,
+        *,
+        store: Any,
+        process_group: Any,
+        workers: list[Any],
+        rank: int,
+        generation_id: str,
+    ) -> None:
         self.store = store
         self.process_group = process_group
         self.workers = list(workers)
         self.rank = int(rank)
+        self.generation_id = str(generation_id)
+        self.checkpoint_generation_seq = 0
         self.seq = 0
         self.states: dict[str, Any] = {}
         self.warmed = False
+        self.store_path_warmed = False
         self.init_profile: dict[str, float] = {}
 
 
@@ -877,7 +1215,13 @@ def _spare_worker_main(
             sys.path.insert(0, root)
     import torch.distributed as dist
     from racer.config import RacerConfig  # type: ignore
-    from racer.distributed import distributed_load, distributed_load_from_storage, distributed_store  # type: ignore
+    from racer.distributed import (  # type: ignore
+        distributed_load,
+        distributed_load_from_storage,
+        finalize_distributed_store_many,
+        prepare_distributed_store_many,
+        distributed_store,
+    )
 
     torch.cuda.set_device(spare_cuda_device)
     store = dist.TCPStore(
@@ -924,15 +1268,47 @@ def _spare_worker_main(
                     str(tag_key): {int(rank): int(nbytes) for rank, nbytes in dict(sizes).items()}
                     for tag_key, sizes in dict(command.get("packet_sizes_by_tag", {}) or {}).items()
                 }
-                for store_tag in store_tags:
-                    states[store_tag] = distributed_store(
-                        config=config,
-                        local_packet=None,
-                        tag=store_tag,
-                        process_group=pg,
-                        chunk_storage=chunk_storage,
-                        packet_sizes_by_rank=packet_sizes_by_tag.get(store_tag),
-                    )
+                if op == "store_many":
+                    completion_key = str(command.get("completion_key", "") or "")
+                    try:
+                        batch_handle = prepare_distributed_store_many(
+                            config=config,
+                            tags=store_tags,
+                            local_packets=[None] * len(store_tags),
+                            process_group=pg,
+                            chunk_storage=chunk_storage,
+                            packet_sizes_by_tag=packet_sizes_by_tag,
+                        )
+                        batch_states = finalize_distributed_store_many(batch_handle)
+                        states.update({state.tag: state for state in batch_states})
+                        if completion_key:
+                            store.set(
+                                completion_key,
+                                json.dumps({"ok": True, "tags": store_tags}).encode("utf-8"),
+                            )
+                    except BaseException as exc:
+                        if completion_key:
+                            store.set(
+                                completion_key,
+                                json.dumps(
+                                    {
+                                        "ok": False,
+                                        "error_type": type(exc).__name__,
+                                        "message": str(exc),
+                                    }
+                                ).encode("utf-8"),
+                            )
+                        raise
+                else:
+                    for store_tag in store_tags:
+                        states[store_tag] = distributed_store(
+                            config=config,
+                            local_packet=None,
+                            tag=store_tag,
+                            process_group=pg,
+                            chunk_storage=chunk_storage,
+                            packet_sizes_by_rank=packet_sizes_by_tag.get(store_tag),
+                        )
             elif op in {"load", "load_many"}:
                 failed = [int(v) for v in command.get("failed_train_ranks", [])]
                 requested = [int(v) for v in command.get("requested_train_ranks", [])]
@@ -964,7 +1340,10 @@ def _spare_worker_main(
                         raise KeyError(f"RACER distributed state {load_tag!r} is not resident")
             elif op == "delete_many":
                 for delete_tag in command.get("tags", []):
-                    states.pop(str(delete_tag), None)
+                    delete_tag = str(delete_tag)
+                    states.pop(delete_tag, None)
+                    if chunk_storage is not None:
+                        chunk_storage.delete(delete_tag)
             else:
                 raise ValueError(f"unknown RACER spare worker command: {op!r}")
             seq += 1
@@ -1110,13 +1489,31 @@ def _distributed_runtime(args: Any) -> _RacerDistributedRuntime:
         )
         init_profile["racer_runtime_tcpstore_connect_ms"] = (time.perf_counter() - client_store_start) * 1000.0
     assert store is not None
+    generation_key = "racer_checkpoint_generation_id"
+    if rank == coordinator_rank:
+        store.set(
+            generation_key,
+            f"{time.time_ns():x}-{os.getpid():x}".encode("utf-8"),
+        )
+    raw_generation = store.get(generation_key)
+    generation_id = (
+        raw_generation.decode("utf-8")
+        if isinstance(raw_generation, bytes)
+        else str(raw_generation)
+    )
     pg_start = time.perf_counter()
     pg = torch.distributed.ProcessGroupNCCL(store, racer_rank, world_size, torch.distributed.ProcessGroupNCCL.Options())
     init_profile["racer_runtime_pg_create_ms"] = (time.perf_counter() - pg_start) * 1000.0
     eager_start = time.perf_counter()
     _eager_connect_single_device(pg, device)
     init_profile["racer_runtime_eager_connect_ms"] = (time.perf_counter() - eager_start) * 1000.0
-    _SESSION.distributed_runtime = _RacerDistributedRuntime(store=store, process_group=pg, workers=workers, rank=racer_rank)
+    _SESSION.distributed_runtime = _RacerDistributedRuntime(
+        store=store,
+        process_group=pg,
+        workers=workers,
+        rank=racer_rank,
+        generation_id=generation_id,
+    )
     atexit.register(_shutdown_distributed_runtime)
     warmup_enabled = os.environ.get("RACER_DISTRIBUTED_RUNTIME_WARMUP", "1").lower() in {"1", "true", "yes", "on"}
     if warmup_enabled:
@@ -1195,6 +1592,73 @@ def _warmup_distributed_runtime(args: Any) -> None:
     runtime.warmed = True
 
 
+def _warmup_distributed_store_path(args: Any, device: torch.device) -> dict[str, float]:
+    """Exercise the real batched runtime/CSD path before training starts."""
+
+    runtime = _distributed_runtime(args)
+    if runtime.store_path_warmed:
+        return {"store_path_warmup_ms": 0.0}
+
+    from racer.distributed import (  # type: ignore
+        finalize_distributed_store_many,
+        prepare_distributed_store_many,
+    )
+
+    started_at = time.perf_counter()
+    warmup_nbytes = max(
+        1,
+        int(os.environ.get("RACER_DISTRIBUTED_STORE_WARMUP_BYTES", "1")),
+    )
+    tag = f"__racer_store_path_warmup__:{runtime.generation_id}"
+    packet_sizes = {
+        int(rank): warmup_nbytes for rank in _racer_pg_train_ranks(args)
+    }
+    runtime, completion_key = _send_spare_store_many(
+        args,
+        tags=[tag],
+        packet_sizes_by_tag={tag: packet_sizes},
+    )
+    chunk_storage = _racer_chunk_storage(args)
+    packet = torch.zeros(warmup_nbytes, dtype=torch.uint8, device=device)
+    launch_stream = _racer_launch_stream(device)
+    with torch.cuda.stream(launch_stream):
+        handle = prepare_distributed_store_many(
+            config=_distributed_config(args),
+            tags=[tag],
+            local_packets=[packet],
+            process_group=runtime.process_group,
+            chunk_storage=chunk_storage,
+            packet_sizes_by_tag={tag: packet_sizes},
+        )
+    states = finalize_distributed_store_many(handle)
+    if runtime.rank == 0:
+        runtime.store.wait([completion_key])
+        raw_status = runtime.store.get(completion_key)
+        status = json.loads(
+            raw_status.decode("utf-8")
+            if isinstance(raw_status, bytes)
+            else str(raw_status)
+        )
+        if not bool(status.get("ok", False)):
+            raise RuntimeError(
+                "RACER remote spare failed during distributed store warmup: "
+                f"{status.get('error_type', 'RuntimeError')}: "
+                f"{status.get('message', 'unknown error')}"
+            )
+    _barrier()
+    for state in states:
+        runtime.states.pop(str(state.tag), None)
+    _send_spare_delete_many(args, [tag])
+    if _is_racer_csd_delete_coordinator():
+        chunk_storage.delete(tag)
+    _barrier()
+    runtime.store_path_warmed = True
+    return {
+        "store_path_warmup_ms": (time.perf_counter() - started_at) * 1000.0,
+        "store_path_warmup_bytes": float(warmup_nbytes),
+    }
+
+
 def _prewarm_distributed_runtime_and_staging(args: Any) -> dict[str, float]:
     if not (racer_distributed_store_enabled(args) and _distributed_initialized()):
         return {}
@@ -1218,10 +1682,14 @@ def _prewarm_distributed_runtime_and_staging(args: Any) -> dict[str, float]:
         stats = _payload_buffer_pool().prewarm(
             chunk_size=int(getattr(args, "racer_buffer_size", 64 * 1024 * 1024)),
             chunk_count=prewarm_payload_chunks,
+            device=device,
         )
         payload_pool_ms_local = (time.perf_counter() - payload_start) * 1000.0
         payload_pool_chunks = float(stats.get("payload_pool_buffer_count", prewarm_payload_chunks))
         payload_pool_reserved = float(stats.get("payload_pool_reserved_nbytes", 0.0))
+        payload_cuda_slots = float(stats.get("payload_cuda_slot_count", 0.0))
+    else:
+        payload_cuda_slots = 0.0
     if _racer_csd_storage_enabled(args):
         from racer.csd import prewarm_cuda_ipc_staging  # type: ignore
 
@@ -1236,20 +1704,28 @@ def _prewarm_distributed_runtime_and_staging(args: Any) -> dict[str, float]:
         )
         staging_ms_local = (time.perf_counter() - staging_start) * 1000.0
         staging_slabs = float(stats.get("slabs_in_pool", slab_count))
+    store_path_profile = _warmup_distributed_store_path(args, device)
+    store_path_ms_local = float(store_path_profile.get("store_path_warmup_ms", 0.0))
     runtime_ms_max = _max_float_across_ranks(runtime_ms_local, device)
     staging_ms_max = _max_float_across_ranks(staging_ms_local, device)
     staging_slabs_max = _max_float_across_ranks(staging_slabs, device)
     payload_pool_ms_max = _max_float_across_ranks(payload_pool_ms_local, device)
     payload_pool_chunks_max = _max_float_across_ranks(payload_pool_chunks, device)
     payload_pool_reserved_max = _max_float_across_ranks(payload_pool_reserved, device)
+    payload_cuda_slots_max = _max_float_across_ranks(payload_cuda_slots, device)
+    store_path_ms_max = _max_float_across_ranks(store_path_ms_local, device)
     return {
         "runtime_ms": runtime_ms_max,
         "staging_ms": staging_ms_max,
         "payload_pool_ms": payload_pool_ms_max,
-        "total_ms": runtime_ms_max + staging_ms_max + payload_pool_ms_max,
+        "total_ms": (
+            runtime_ms_max + staging_ms_max + payload_pool_ms_max + store_path_ms_max
+        ),
         "staging_slabs": staging_slabs_max,
         "payload_pool_chunks": payload_pool_chunks_max,
         "payload_pool_reserved_nbytes": payload_pool_reserved_max,
+        "payload_cuda_slots": payload_cuda_slots_max,
+        "store_path_ms": store_path_ms_max,
     }
 
 
@@ -1320,9 +1796,10 @@ def _send_spare_store_many(
     *,
     tags: list[str],
     packet_sizes_by_tag: dict[str, dict[int, int]] | None = None,
-) -> _RacerDistributedRuntime:
+) -> tuple[_RacerDistributedRuntime, str]:
     runtime = _distributed_runtime(args)
     seq = runtime.seq
+    completion_key = f"racer_store_many_complete_{seq:08d}"
     if runtime.rank == 0:
         command = {
             "op": "store_many",
@@ -1332,14 +1809,14 @@ def _send_spare_store_many(
                 str(tag): {str(rank): int(nbytes) for rank, nbytes in dict(sizes).items()}
                 for tag, sizes in dict(packet_sizes_by_tag or {}).items()
             },
+            "completion_key": completion_key,
             "failed_train_ranks": [],
             "requested_train_ranks": [],
             "replacement_mapping": {},
         }
         runtime.store.set(f"racer_cmd_{seq}", json.dumps(command).encode("utf-8"))
-    _barrier()
     runtime.seq += 1
-    return runtime
+    return runtime, completion_key
 
 
 def _send_spare_load_many(
@@ -1362,7 +1839,6 @@ def _send_spare_load_many(
             "replacement_mapping": _to_racer_pg_replacement_mapping(args, replacement_mapping),
         }
         runtime.store.set(f"racer_cmd_{seq}", json.dumps(command).encode("utf-8"))
-    _barrier()
     runtime.seq += 1
     return runtime
 
@@ -1375,7 +1851,6 @@ def _send_spare_delete_many(args: Any, tags: list[str]) -> None:
     if runtime.rank == 0:
         command = {"op": "delete_many", "tag": "__delete_many__", "tags": list(tags)}
         runtime.store.set(f"racer_cmd_{seq}", json.dumps(command).encode("utf-8"))
-    _barrier()
     runtime.seq += 1
 
 
@@ -1403,6 +1878,11 @@ def _prune_old_checkpoints(args: Any) -> None:
             _manifest_path(args, stale_tag).unlink(missing_ok=True)
         except OSError:
             pass
+        if _rank() == 0:
+            try:
+                _checkpoint_commit_marker_path(args, stale_tag).unlink(missing_ok=True)
+            except OSError:
+                pass
     for stale_iteration, stale_tag in list(_SESSION.tags_by_iteration.items()):
         if stale_tag not in keep_tags:
             _SESSION.tags_by_iteration.pop(stale_iteration, None)
@@ -1419,7 +1899,6 @@ def _prune_old_checkpoints(args: Any) -> None:
             if storage is not None and _is_racer_csd_delete_coordinator():
                 for chunk_tag in chunk_tags:
                     storage.delete(chunk_tag)
-            _barrier()
     else:
         ctx = _SESSION.local_racer_context
         if ctx is not None:
@@ -1461,8 +1940,14 @@ _STORE_PROFILE_KEYS = (
     "parity_ms",
     "storage_ms",
     "final_barrier_ms",
+    "group_transfer_barrier_ms",
+    "group_storage_barrier_ms",
     "manifest_ms",
     "total_ms",
+    "store_batch_prepare_ms",
+    "store_batch_finalize_ms",
+    "store_batch_total_ms",
+    "store_batch_tag_count",
     "data_rows_bytes_sent",
     "parity_bytes_sent",
     "local_storage_nbytes",
@@ -1486,10 +1971,14 @@ _STORE_PROFILE_KEYS = (
     "storage_begin_ms",
     "storage_begin_barrier_ms",
     "storage_enqueue_ms",
+    "storage_enqueue_barrier_ms",
     "storage_wait_ms",
+    "storage_manifest_put_ms",
     "storage_commit_pre_barrier_ms",
     "storage_commit_ms",
     "storage_commit_post_barrier_ms",
+    "storage_commit_retry_count",
+    "storage_commit_wait_ms",
     "csd_client_put_contiguous_ms",
     "csd_client_put_export_ms",
     "csd_client_put_rpc_ms",
@@ -1543,7 +2032,7 @@ _tensor_from_cuda_bytes = tensor_tree.tensor_from_cuda_bytes
 _decode_tensor_tree = tensor_tree.decode_tensor_tree
 
 
-def _distributed_store_tensor_tree(
+def _prepare_distributed_store_tensor_tree(
     args: Any,
     *,
     tag: str,
@@ -1552,11 +2041,10 @@ def _distributed_store_tensor_tree(
     ckpt_type: str,
     state_for_save: dict[str, Any],
     device: torch.device,
-) -> dict[str, Any]:
+) -> _PreparedDistributedSave:
     metadata_start = time.perf_counter()
     skeleton, metas, tensors = _extract_tensor_tree(state_for_save)
     metadata_ms = (time.perf_counter() - metadata_start) * 1000.0
-    metadata_ms_max = _max_float_across_ranks(metadata_ms, device)
     local_leaf_count = len(tensors)
     max_leaf_count = _max_int_across_ranks(local_leaf_count, device)
     local_bytes = sum(int(meta.get("nbytes", 0)) for meta in metas)
@@ -1587,7 +2075,7 @@ def _distributed_store_tensor_tree(
             f"chunks={len(payload_checksums)}, ms={payload_checksum_ms_local:.2f}",
             flush=True,
         )
-    _SESSION.tree_checkpoints[tag] = {
+    tree = {
         "skeleton": skeleton,
         "metas": metas,
         "source_tensors": tensors,
@@ -1598,22 +2086,14 @@ def _distributed_store_tensor_tree(
         "iteration": int(iteration),
         "release": bool(release),
         "ckpt_type": str(ckpt_type),
+        "requires_commit_marker": True,
     }
     if payload_checksum_mode:
-        _SESSION.tree_checkpoints[tag]["payload_checksum_mode"] = payload_checksum_mode
-        _SESSION.tree_checkpoints[tag]["payload_checksums"] = list(payload_checksums)
-    _write_tree_manifest(args, tag, _SESSION.tree_checkpoints[tag])
-
-    _barrier()
-    store_start = time.perf_counter()
-    tensor_view_ms_local = 0.0
-    racer_calls_ms_local = 0.0
-    racer_profile_local: dict[str, float] = {}
+        tree["payload_checksum_mode"] = payload_checksum_mode
+        tree["payload_checksums"] = list(payload_checksums)
     chunk_tags = [_chunk_tag(tag, chunk_index) for chunk_index in range(int(max_chunk_count))]
 
     _racer_module(args)
-    from racer.distributed import distributed_store  # type: ignore
-
     packet_sizes_by_tag = _gather_packet_sizes_by_chunk(
         args,
         chunk_tags=chunk_tags,
@@ -1621,113 +2101,266 @@ def _distributed_store_tensor_tree(
         device=device,
     )
     command_start = time.perf_counter()
-    runtime = (
-        _send_spare_store_many(args, tags=chunk_tags, packet_sizes_by_tag=packet_sizes_by_tag)
-        if chunk_tags
-        else _distributed_runtime(args)
+    if chunk_tags:
+        runtime, spare_completion_key = _send_spare_store_many(
+            args,
+            tags=chunk_tags,
+            packet_sizes_by_tag=packet_sizes_by_tag,
+        )
+    else:
+        runtime = _distributed_runtime(args)
+        spare_completion_key = None
+    tree["checkpoint_generation"] = (
+        f"{runtime.generation_id}:{runtime.checkpoint_generation_seq}:{tag}"
     )
+    runtime.checkpoint_generation_seq += 1
     store_command_ms_local = (time.perf_counter() - command_start) * 1000.0
-    _accumulate_numeric_profile(racer_profile_local, getattr(runtime, "init_profile", None))
     chunk_storage = _racer_chunk_storage(args)
-    chunk_store_ms_values: list[float] = []
-    for chunk_index, chunk_tag in enumerate(chunk_tags):
+    store_started_at = time.perf_counter()
+    from racer.distributed import prepare_distributed_store_many  # type: ignore
+
+    launch_stream = _racer_launch_stream(device)
+    with torch.cuda.stream(launch_stream):
         tensor_view_start = time.perf_counter()
-        if chunk_index < local_chunk_count:
-            local_packet = payload_chunks.cuda_payload(chunk_index, device)
-        else:
-            local_packet = _tensor_to_cuda_bytes(None, device)
-        tensor_view_ms_local += (time.perf_counter() - tensor_view_start) * 1000.0
-        racer_call_start = time.perf_counter()
-        state = distributed_store(
+        local_packets: list[torch.Tensor] = []
+        for chunk_index, _chunk_tag_value in enumerate(chunk_tags):
+            if chunk_index < local_chunk_count:
+                local_packet = payload_chunks.cuda_payload(
+                    chunk_index,
+                    device,
+                    slot_id=chunk_index,
+                )
+            else:
+                local_packet = _tensor_to_cuda_bytes(None, device)
+            local_packets.append(local_packet)
+        tensor_view_ms_local = (time.perf_counter() - tensor_view_start) * 1000.0
+        racer_prepare_start = time.perf_counter()
+        distributed_store_handle = prepare_distributed_store_many(
             config=_distributed_config(args),
-            local_packet=local_packet,
-            tag=chunk_tag,
+            tags=chunk_tags,
+            local_packets=local_packets,
             process_group=runtime.process_group,
             chunk_storage=chunk_storage,
-            packet_sizes_by_rank=packet_sizes_by_tag.get(chunk_tag),
+            packet_sizes_by_tag=packet_sizes_by_tag,
         )
-        chunk_store_ms = (time.perf_counter() - racer_call_start) * 1000.0
+    racer_prepare_ms_local = (time.perf_counter() - racer_prepare_start) * 1000.0
+    return _PreparedDistributedSave(
+        args=args,
+        tag=tag,
+        iteration=int(iteration),
+        release=bool(release),
+        ckpt_type=str(ckpt_type),
+        device=device,
+        tree=tree,
+        payload_chunks=payload_chunks,
+        packet_sizes_by_tag=packet_sizes_by_tag,
+        chunk_tags=chunk_tags,
+        runtime=runtime,
+        chunk_storage=chunk_storage,
+        metadata_ms_local=metadata_ms,
+        payload_pack_ms_local=payload_pack_ms_local,
+        payload_checksum_ms_local=payload_checksum_ms_local,
+        payload_checksums=list(payload_checksums),
+        local_leaf_count=int(local_leaf_count),
+        max_leaf_count=int(max_leaf_count),
+        local_bytes=int(local_bytes),
+        payload_bytes_total=int(payload_bytes_total),
+        local_chunk_count=int(local_chunk_count),
+        max_chunk_count=int(max_chunk_count),
+        chunk_size=int(chunk_size),
+        store_command_ms_local=store_command_ms_local,
+        distributed_store_handle=distributed_store_handle,
+        spare_completion_key=spare_completion_key,
+        tensor_view_ms_local=tensor_view_ms_local,
+        racer_prepare_ms_local=racer_prepare_ms_local,
+        store_started_at=store_started_at,
+    )
+
+
+def _execute_prepared_distributed_store(prepared: _PreparedDistributedSave) -> _ExecutedDistributedSave:
+    args = prepared.args
+    tag = prepared.tag
+    device = prepared.device
+    runtime = prepared.runtime
+    torch.cuda.set_device(device)
+    racer_profile_local: dict[str, float] = {}
+    _accumulate_numeric_profile(racer_profile_local, getattr(runtime, "init_profile", None))
+    from racer.distributed import finalize_distributed_store_many  # type: ignore
+
+    finalize_start = time.perf_counter()
+    batch_states = finalize_distributed_store_many(prepared.distributed_store_handle)
+    if runtime.rank == 0 and prepared.spare_completion_key:
+        runtime.store.wait([prepared.spare_completion_key])
+        raw_status = runtime.store.get(prepared.spare_completion_key)
+        status = json.loads(
+            raw_status.decode("utf-8")
+            if isinstance(raw_status, bytes)
+            else str(raw_status)
+        )
+        if not bool(status.get("ok", False)):
+            raise RuntimeError(
+                "RACER remote spare failed while finalizing async checkpoint: "
+                f"{status.get('error_type', 'RuntimeError')}: "
+                f"{status.get('message', 'unknown error')}"
+            )
+    racer_finalize_ms_local = (time.perf_counter() - finalize_start) * 1000.0
+    racer_calls_ms_local = (
+        float(prepared.racer_prepare_ms_local) + racer_finalize_ms_local
+    )
+    chunk_store_ms_values: list[float] = []
+    for state in batch_states:
+        chunk_tag = str(state.tag)
         runtime.states[chunk_tag] = state
-        chunk_store_ms_values.append(chunk_store_ms)
-        racer_calls_ms_local += chunk_store_ms
-        for key, value in dict(getattr(state, "profile", None) or {}).items():
-            if isinstance(value, (int, float)):
-                racer_profile_local[key] = racer_profile_local.get(key, 0.0) + float(value)
-    store_wall_ms_local = (time.perf_counter() - store_start) * 1000.0
-    store_wall_ms_max = _max_float_across_ranks(store_wall_ms_local, device)
-    store_command_ms_max = _max_float_across_ranks(store_command_ms_local, device)
-    tensor_view_ms_max = _max_float_across_ranks(tensor_view_ms_local, device)
-    racer_calls_ms_max = _max_float_across_ranks(racer_calls_ms_local, device)
+        state_profile = dict(getattr(state, "profile", None) or {})
+        chunk_store_ms_values.append(float(state_profile.get("total_ms", 0.0)))
+        _accumulate_numeric_profile(racer_profile_local, state_profile)
+    store_wall_ms_local = (time.perf_counter() - prepared.store_started_at) * 1000.0
+    return _ExecutedDistributedSave(
+        prepared=prepared,
+        tensor_view_ms_local=prepared.tensor_view_ms_local,
+        racer_calls_ms_local=racer_calls_ms_local,
+        racer_profile_local=racer_profile_local,
+        chunk_store_ms_values=chunk_store_ms_values,
+        store_wall_ms_local=store_wall_ms_local,
+    )
+
+
+def _finalize_executed_distributed_store(executed: _ExecutedDistributedSave) -> dict[str, Any]:
+    prepared = executed.prepared
+    args = prepared.args
+    tag = prepared.tag
+    iteration = prepared.iteration
+    release = prepared.release
+    ckpt_type = prepared.ckpt_type
+    device = prepared.device
+    payload_chunks = prepared.payload_chunks
+    metadata_ms = prepared.metadata_ms_local
+    payload_pack_ms_local = prepared.payload_pack_ms_local
+    payload_checksum_ms_local = prepared.payload_checksum_ms_local
+    payload_checksums = prepared.payload_checksums
+    local_leaf_count = prepared.local_leaf_count
+    max_leaf_count = prepared.max_leaf_count
+    local_bytes = prepared.local_bytes
+    payload_bytes_total = prepared.payload_bytes_total
+    local_chunk_count = prepared.local_chunk_count
+    max_chunk_count = prepared.max_chunk_count
+    chunk_size = prepared.chunk_size
+    store_command_ms_local = prepared.store_command_ms_local
+    tensor_view_ms_local = executed.tensor_view_ms_local
+    racer_calls_ms_local = executed.racer_calls_ms_local
+    racer_profile_local = executed.racer_profile_local
+    chunk_store_ms_values = executed.chunk_store_ms_values
+    store_wall_ms_local = executed.store_wall_ms_local
     chunk_store_ms_sum_local = sum(chunk_store_ms_values)
     chunk_store_ms_max_local = max(chunk_store_ms_values, default=0.0)
-    chunk_store_ms_sum_max = _max_float_across_ranks(chunk_store_ms_sum_local, device)
-    chunk_store_ms_max = _max_float_across_ranks(chunk_store_ms_max_local, device)
     wrapper_gap_ms_local = max(
         0.0,
-        store_wall_ms_local - store_command_ms_local - tensor_view_ms_local - racer_calls_ms_local,
+        store_wall_ms_local - tensor_view_ms_local - racer_calls_ms_local,
     )
-    wrapper_gap_ms_max = _max_float_across_ranks(wrapper_gap_ms_local, device)
-    racer_profile_max = {
-        key: _max_float_across_ranks(racer_profile_local.get(key, 0.0), device)
-        for key in _STORE_PROFILE_KEYS
+    payload_profile = payload_chunks.profile
+    max_values_local = {
+        "metadata_ms": metadata_ms,
+        "store_wall_ms": store_wall_ms_local,
+        "store_command_ms": store_command_ms_local,
+        "tensor_view_ms": tensor_view_ms_local,
+        "racer_calls_ms": racer_calls_ms_local,
+        "chunk_store_ms_sum": chunk_store_ms_sum_local,
+        "chunk_store_ms": chunk_store_ms_max_local,
+        "wrapper_gap_ms": wrapper_gap_ms_local,
+        "payload_pack_ms": payload_pack_ms_local,
+        "payload_checksum_save_ms": payload_checksum_ms_local,
+        "payload_pack_slot_alloc_ms": float(payload_profile.get("payload_pack_slot_alloc_ms", 0.0)),
+        "payload_pack_host_alloc_ms": float(payload_profile.get("payload_pack_host_alloc_ms", 0.0)),
+        "payload_pack_tensor_view_ms": float(payload_profile.get("payload_pack_tensor_view_ms", 0.0)),
+        "payload_pack_device_gather_enqueue_ms": float(
+            payload_profile.get("payload_pack_device_gather_enqueue_ms", 0.0)
+        ),
+        "payload_pack_host_copy_enqueue_ms": float(
+            payload_profile.get("payload_pack_host_copy_enqueue_ms", 0.0)
+        ),
+        "payload_pack_slot_reuse_wait_enqueue_ms": float(
+            payload_profile.get("payload_pack_slot_reuse_wait_enqueue_ms", 0.0)
+        ),
+        "payload_pack_final_sync_ms": float(payload_profile.get("payload_pack_final_sync_ms", 0.0)),
+        "payload_pack_segment_count": float(payload_profile.get("payload_pack_segment_count", 0.0)),
+        "payload_pack_chunk_count": float(payload_profile.get("payload_pack_chunk_count", 0.0)),
+        "payload_pool_ensure_ms": float(payload_profile.get("payload_pool_ensure_ms", 0.0)),
+        "payload_pool_allocated_buffers": float(payload_profile.get("payload_pool_allocated_buffers", 0.0)),
+        "payload_pool_reused_buffers": float(payload_profile.get("payload_pool_reused_buffers", 0.0)),
+        "payload_pool_buffer_count": float(payload_profile.get("payload_pool_buffer_count", 0.0)),
+        "payload_pool_reserved_nbytes": float(payload_profile.get("payload_pool_reserved_nbytes", 0.0)),
     }
+    max_values_local.update(
+        {f"racer_profile:{key}": racer_profile_local.get(key, 0.0) for key in _STORE_PROFILE_KEYS}
+    )
+    max_values = _max_floats_across_ranks(max_values_local, device)
+    metadata_ms_max = max_values["metadata_ms"]
+    store_wall_ms_max = max_values["store_wall_ms"]
+    store_command_ms_max = max_values["store_command_ms"]
+    tensor_view_ms_max = max_values["tensor_view_ms"]
+    racer_calls_ms_max = max_values["racer_calls_ms"]
+    chunk_store_ms_sum_max = max_values["chunk_store_ms_sum"]
+    chunk_store_ms_max = max_values["chunk_store_ms"]
+    wrapper_gap_ms_max = max_values["wrapper_gap_ms"]
+    racer_profile_max = {
+        key: max_values[f"racer_profile:{key}"] for key in _STORE_PROFILE_KEYS
+    }
+    encoded_storage_bytes_total = _sum_int_across_ranks(
+        int(racer_profile_local.get("local_storage_nbytes", 0.0)),
+        device,
+    )
+    store_wall_seconds = store_wall_ms_max / 1000.0
+    logical_store_bandwidth_gbps = (
+        (float(payload_bytes_total) / 1_000_000_000.0) / store_wall_seconds
+        if store_wall_seconds > 0.0
+        else 0.0
+    )
+    encoded_store_bandwidth_gbps = (
+        (float(encoded_storage_bytes_total) / 1_000_000_000.0) / store_wall_seconds
+        if store_wall_seconds > 0.0
+        else 0.0
+    )
+    copy_event_ms_max = float(racer_profile_max.get("csd_daemon_memcpy_ms_cuda_event", 0.0))
+    egm_copy_bandwidth_gbps = (
+        (float(encoded_storage_bytes_total) / 1_000_000_000.0) / (copy_event_ms_max / 1000.0)
+        if copy_event_ms_max > 0.0
+        else 0.0
+    )
     report = {
         "tag": tag,
         "iteration": int(iteration),
         "release": bool(release),
         "ckpt_type": str(ckpt_type),
         "tensor_tree_metadata_ms_max": metadata_ms_max,
-        "payload_pack_ms_max": _max_float_across_ranks(payload_pack_ms_local, device),
-        "payload_checksum_save_ms_max": _max_float_across_ranks(payload_checksum_ms_local, device),
+        "payload_pack_ms_max": max_values["payload_pack_ms"],
+        "payload_checksum_save_ms_max": max_values["payload_checksum_save_ms"],
         "payload_checksum_chunks_local": int(len(payload_checksums)),
-        "payload_pack_slot_alloc_ms_max": _max_float_across_ranks(
-            float(payload_chunks.profile.get("payload_pack_slot_alloc_ms", 0.0)), device
-        ),
-        "payload_pack_host_alloc_ms_max": _max_float_across_ranks(
-            float(payload_chunks.profile.get("payload_pack_host_alloc_ms", 0.0)), device
-        ),
-        "payload_pack_tensor_view_ms_max": _max_float_across_ranks(
-            float(payload_chunks.profile.get("payload_pack_tensor_view_ms", 0.0)), device
-        ),
-        "payload_pack_device_gather_enqueue_ms_max": _max_float_across_ranks(
-            float(payload_chunks.profile.get("payload_pack_device_gather_enqueue_ms", 0.0)), device
-        ),
-        "payload_pack_host_copy_enqueue_ms_max": _max_float_across_ranks(
-            float(payload_chunks.profile.get("payload_pack_host_copy_enqueue_ms", 0.0)), device
-        ),
-        "payload_pack_slot_reuse_wait_enqueue_ms_max": _max_float_across_ranks(
-            float(payload_chunks.profile.get("payload_pack_slot_reuse_wait_enqueue_ms", 0.0)), device
-        ),
-        "payload_pack_final_sync_ms_max": _max_float_across_ranks(
-            float(payload_chunks.profile.get("payload_pack_final_sync_ms", 0.0)), device
-        ),
-        "payload_pack_segment_count_max": _max_float_across_ranks(
-            float(payload_chunks.profile.get("payload_pack_segment_count", 0.0)), device
-        ),
-        "payload_pack_chunk_count_max": _max_float_across_ranks(
-            float(payload_chunks.profile.get("payload_pack_chunk_count", 0.0)), device
-        ),
-        "payload_pool_ensure_ms_max": _max_float_across_ranks(
-            float(payload_chunks.profile.get("payload_pool_ensure_ms", 0.0)), device
-        ),
-        "payload_pool_allocated_buffers_max": _max_float_across_ranks(
-            float(payload_chunks.profile.get("payload_pool_allocated_buffers", 0.0)), device
-        ),
-        "payload_pool_reused_buffers_max": _max_float_across_ranks(
-            float(payload_chunks.profile.get("payload_pool_reused_buffers", 0.0)), device
-        ),
-        "payload_pool_buffer_count_max": _max_float_across_ranks(
-            float(payload_chunks.profile.get("payload_pool_buffer_count", 0.0)), device
-        ),
-        "payload_pool_reserved_nbytes_max": int(
-            _max_float_across_ranks(float(payload_chunks.profile.get("payload_pool_reserved_nbytes", 0.0)), device)
-        ),
+        "payload_pack_slot_alloc_ms_max": max_values["payload_pack_slot_alloc_ms"],
+        "payload_pack_host_alloc_ms_max": max_values["payload_pack_host_alloc_ms"],
+        "payload_pack_tensor_view_ms_max": max_values["payload_pack_tensor_view_ms"],
+        "payload_pack_device_gather_enqueue_ms_max": max_values["payload_pack_device_gather_enqueue_ms"],
+        "payload_pack_host_copy_enqueue_ms_max": max_values["payload_pack_host_copy_enqueue_ms"],
+        "payload_pack_slot_reuse_wait_enqueue_ms_max": max_values[
+            "payload_pack_slot_reuse_wait_enqueue_ms"
+        ],
+        "payload_pack_final_sync_ms_max": max_values["payload_pack_final_sync_ms"],
+        "payload_pack_segment_count_max": max_values["payload_pack_segment_count"],
+        "payload_pack_chunk_count_max": max_values["payload_pack_chunk_count"],
+        "payload_pool_ensure_ms_max": max_values["payload_pool_ensure_ms"],
+        "payload_pool_allocated_buffers_max": max_values["payload_pool_allocated_buffers"],
+        "payload_pool_reused_buffers_max": max_values["payload_pool_reused_buffers"],
+        "payload_pool_buffer_count_max": max_values["payload_pool_buffer_count"],
+        "payload_pool_reserved_nbytes_max": int(max_values["payload_pool_reserved_nbytes"]),
         "payload_pinned_reserved_bytes_local": int(payload_chunks.total_reserved_nbytes),
         "payload_pinned_valid_bytes_local": int(payload_chunks.total_valid_nbytes),
         "racer_store_command_ms_max": store_command_ms_max,
         "tensor_view_ms_max": tensor_view_ms_max,
         "racer_distributed_calls_ms_max": racer_calls_ms_max,
         "racer_distributed_total_ms_max": racer_profile_max.get("total_ms", 0.0),
+        "racer_store_batch_prepare_ms_max": racer_profile_max.get("store_batch_prepare_ms", 0.0),
+        "racer_store_batch_finalize_ms_max": racer_profile_max.get("store_batch_finalize_ms", 0.0),
+        "racer_store_batch_total_ms_max": racer_profile_max.get("store_batch_total_ms", 0.0),
+        "racer_store_batch_tag_count_max": int(racer_profile_max.get("store_batch_tag_count", 0.0)),
         "racer_chunk_store_ms_sum_max": chunk_store_ms_sum_max,
         "racer_chunk_store_ms_max": chunk_store_ms_max,
         "racer_store_wrapper_gap_ms_max": wrapper_gap_ms_max,
@@ -1739,9 +2372,13 @@ def _distributed_store_tensor_tree(
         "racer_storage_begin_ms_max": racer_profile_max.get("storage_begin_ms", 0.0),
         "racer_storage_begin_barrier_ms_max": racer_profile_max.get("storage_begin_barrier_ms", 0.0),
         "racer_storage_enqueue_ms_max": racer_profile_max.get("storage_enqueue_ms", 0.0),
+        "racer_storage_enqueue_barrier_ms_max": racer_profile_max.get("storage_enqueue_barrier_ms", 0.0),
         "racer_storage_wait_ms_max": racer_profile_max.get("storage_wait_ms", 0.0),
+        "racer_storage_manifest_put_ms_max": racer_profile_max.get("storage_manifest_put_ms", 0.0),
         "racer_storage_commit_pre_barrier_ms_max": racer_profile_max.get("storage_commit_pre_barrier_ms", 0.0),
         "racer_storage_commit_ms_max": racer_profile_max.get("storage_commit_ms", 0.0),
+        "racer_storage_commit_retry_count_max": racer_profile_max.get("storage_commit_retry_count", 0.0),
+        "racer_storage_commit_wait_ms_max": racer_profile_max.get("storage_commit_wait_ms", 0.0),
         "racer_storage_commit_post_barrier_ms_max": racer_profile_max.get("storage_commit_post_barrier_ms", 0.0),
         "racer_csd_client_put_contiguous_ms_max": racer_profile_max.get("csd_client_put_contiguous_ms", 0.0),
         "racer_csd_client_put_export_ms_max": racer_profile_max.get("csd_client_put_export_ms", 0.0),
@@ -1762,6 +2399,15 @@ def _distributed_store_tensor_tree(
         "racer_distributed_store_wall_ms_max": store_wall_ms_max,
         "racer_distributed_store_wall_ms_local": store_wall_ms_local,
         "payload_bytes_total": int(payload_bytes_total),
+        "racer_encoded_storage_bytes_total": int(encoded_storage_bytes_total),
+        "racer_storage_amplification": (
+            float(encoded_storage_bytes_total) / float(payload_bytes_total)
+            if payload_bytes_total > 0
+            else 0.0
+        ),
+        "racer_logical_store_bandwidth_gbps": logical_store_bandwidth_gbps,
+        "racer_encoded_store_bandwidth_gbps": encoded_store_bandwidth_gbps,
+        "racer_egm_copy_bandwidth_gbps": egm_copy_bandwidth_gbps,
         "payload_bytes_local": int(local_bytes),
         "tensor_leaf_count_local": int(local_leaf_count),
         "tensor_leaf_count_max": int(max_leaf_count),
@@ -1769,6 +2415,8 @@ def _distributed_store_tensor_tree(
         "racer_chunk_count_max": int(max_chunk_count),
         "racer_chunk_size": int(chunk_size),
     }
+    _publish_tree_manifest_with_commit_marker(prepared)
+    _SESSION.tree_checkpoints[tag] = prepared.tree
     _print_rank0(
         "RACER distributed tensor-tree checkpoint stored: "
         f"tag={tag}, store={store_wall_ms_max:.2f} ms, "
@@ -1777,6 +2425,10 @@ def _distributed_store_tensor_tree(
         f"tensor_view={tensor_view_ms_max:.2f} ms, "
         f"racer_calls={racer_calls_ms_max:.2f} ms, "
         f"racer_inner_total={racer_profile_max.get('total_ms', 0.0):.2f} ms, "
+        f"batch_prepare={racer_profile_max.get('store_batch_prepare_ms', 0.0):.2f} ms, "
+        f"batch_finalize={racer_profile_max.get('store_batch_finalize_ms', 0.0):.2f} ms, "
+        f"batch_total={racer_profile_max.get('store_batch_total_ms', 0.0):.2f} ms, "
+        f"batch_tags={int(racer_profile_max.get('store_batch_tag_count', 0.0))}, "
         f"chunk_store_max={chunk_store_ms_max:.2f} ms, "
         f"setup={racer_profile_max.get('setup_ms', 0.0):.2f} ms, "
         f"sizing={racer_profile_max.get('sizing_ms', 0.0):.2f} ms, "
@@ -1785,7 +2437,9 @@ def _distributed_store_tensor_tree(
         f"storage={racer_profile_max.get('storage_ms', 0.0):.2f} ms, "
         f"storage_begin={racer_profile_max.get('storage_begin_ms', 0.0):.2f} ms, "
         f"storage_enqueue={racer_profile_max.get('storage_enqueue_ms', 0.0):.2f} ms, "
+        f"storage_enqueue_barrier={racer_profile_max.get('storage_enqueue_barrier_ms', 0.0):.2f} ms, "
         f"storage_wait={racer_profile_max.get('storage_wait_ms', 0.0):.2f} ms, "
+        f"storage_commit_wait={racer_profile_max.get('storage_commit_wait_ms', 0.0):.2f} ms, "
         f"storage_commit={racer_profile_max.get('storage_commit_ms', 0.0):.2f} ms, "
         f"client_put={racer_profile_max.get('csd_client_put_total_ms', 0.0):.2f} ms, "
         f"client_export={racer_profile_max.get('csd_client_put_export_ms', 0.0):.2f} ms, "
@@ -1800,12 +2454,40 @@ def _distributed_store_tensor_tree(
         f"daemon_enqueue_api={racer_profile_max.get('csd_daemon_enqueue_api_ms', 0.0):.2f} ms, "
         f"staging_copy_enqueue_us={racer_profile_max.get('csd_staging_copy_enqueue_us', 0.0):.2f}, "
         f"wrapper_gap={wrapper_gap_ms_max:.2f} ms, "
+        f"encoded_bytes={int(encoded_storage_bytes_total)}, "
+        f"amplification={float(report['racer_storage_amplification']):.3f}x, "
+        f"logical_bw={logical_store_bandwidth_gbps:.2f} GB/s, "
+        f"encoded_bw={encoded_store_bandwidth_gbps:.2f} GB/s, "
+        f"egm_copy_bw={egm_copy_bandwidth_gbps:.2f} GB/s, "
         f"bytes={int(payload_bytes_total)}, "
         f"local_bytes={int(local_bytes)}, "
         f"leaves={int(max_leaf_count)}, "
         f"chunks={int(max_chunk_count)}"
     )
     return report
+
+
+def _distributed_store_tensor_tree(
+    args: Any,
+    *,
+    tag: str,
+    iteration: int,
+    release: bool,
+    ckpt_type: str,
+    state_for_save: dict[str, Any],
+    device: torch.device,
+) -> dict[str, Any]:
+    prepared = _prepare_distributed_store_tensor_tree(
+        args,
+        tag=tag,
+        iteration=iteration,
+        release=release,
+        ckpt_type=ckpt_type,
+        state_for_save=state_for_save,
+        device=device,
+    )
+    executed = _execute_prepared_distributed_store(prepared)
+    return _finalize_executed_distributed_store(executed)
 
 
 def _distributed_load_tensor_tree(
@@ -2530,6 +3212,15 @@ def _max_float_across_ranks(value: float, device: torch.device) -> float:
     tensor = torch.tensor([float(value)], dtype=torch.float64, device=device)
     torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
     return float(tensor.item())
+
+
+def _max_floats_across_ranks(values: dict[str, float], device: torch.device) -> dict[str, float]:
+    items = [(key, float(value)) for key, value in values.items()]
+    if not _distributed_initialized():
+        return dict(items)
+    tensor = torch.tensor([value for _, value in items], dtype=torch.float64, device=device)
+    torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+    return {key: float(value) for (key, _), value in zip(items, tensor.tolist())}
 
 
 def _max_int_across_ranks(value: int, device: torch.device) -> int:

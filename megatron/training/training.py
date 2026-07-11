@@ -2262,6 +2262,10 @@ def save_checkpoint_and_time(
     args = get_args()
     timers = get_timers()
     energy_monitor = get_energy_monitor()
+    racer_async_checkpoint = bool(
+        getattr(args, "racer_checkpoint", False)
+        and getattr(args, "racer_async_offload", False)
+    )
 
     # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
     if should_disable_forward_pre_hook(args):
@@ -2273,7 +2277,13 @@ def save_checkpoint_and_time(
 
     # Extra barrier is added to make sure all ranks report the max time.
     timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
-    timers(timer_key, log_level=0).start(barrier=True)
+    if racer_async_checkpoint:
+        # Megatron's CUDA timer stop synchronizes every stream.  That would
+        # wait for RACER's dedicated launch stream and turn an async save back
+        # into a synchronous one, so measure only caller wall time here.
+        save_checkpoint_wall_start = time.perf_counter()
+    else:
+        timers(timer_key, log_level=0).start(barrier=True)
 
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
@@ -2313,13 +2323,20 @@ def save_checkpoint_and_time(
         # dequantized bf16 tensors that were temporarily created during fp8
         # model checkpoint saving.
         gc.collect()
-    timers(timer_key).stop(barrier=True)
-    save_checkpoint_duration = timers(timer_key).elapsed()
-    timers.log([timer_key])
+    if racer_async_checkpoint:
+        save_checkpoint_duration = time.perf_counter() - save_checkpoint_wall_start
+    else:
+        timers(timer_key).stop(barrier=True)
+        save_checkpoint_duration = timers(timer_key).elapsed()
+        timers.log([timer_key])
 
     # Log E2E metrics after save-checkpoint
     one_logger_utils.track_e2e_metrics()
-    one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
+    one_logger_utils.on_save_checkpoint_end(
+        save_checkpoint_duration,
+        iteration,
+        bool(args.async_save or racer_async_checkpoint),
+    )
     if getattr(args, "racer_checkpoint", False):
         print_rank_0(
             f"RACER save blocking time: iteration={iteration}, "
@@ -2365,7 +2382,10 @@ def save_checkpoint_and_time(
 
     # Recover timing
     energy_monitor.resume()
-    timers('interval-time', log_level=0).start(barrier=True)
+    timers('interval-time', log_level=0).start(
+        barrier=not racer_async_checkpoint,
+        sync_cuda=not racer_async_checkpoint,
+    )
 
 
 def post_training_step_callbacks(
