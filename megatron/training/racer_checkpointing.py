@@ -663,7 +663,18 @@ def load_memory_checkpoint(
                 "checkpoint_name": checkpoint_name,
             }
         )
-        payload_pool_prewarm = _prewarm_payload_buffer_pool_from_tree(_SESSION.tree_checkpoints.get(load_tag))
+        if os.environ.get("RACER_PAYLOAD_POOL_PREWARM_AFTER_LOAD", "1").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            payload_pool_prewarm = _prewarm_payload_buffer_pool_from_tree(
+                _SESSION.tree_checkpoints.get(load_tag)
+            )
+        else:
+            payload_pool_prewarm = {}
+            report["racer_payload_pool_tree_prewarm_skipped_after_load"] = 1
         if payload_pool_prewarm:
             device = _current_cuda_device()
             report["racer_payload_pool_prewarm_after_load_ms"] = _max_float_across_ranks(
@@ -1576,6 +1587,7 @@ def _distributed_config_dict(args: Any) -> dict[str, Any]:
         "spare_ranks": _racer_pg_spare_ranks(args),
         "buffer_size": int(getattr(args, "racer_buffer_size", 64 * 1024 * 1024)),
         "optimize_cauchy": bool(getattr(args, "racer_optimize_cauchy", False)),
+        "max_inflight_ec_groups": int(os.environ.get("RACER_MAX_INFLIGHT_EC_GROUPS", "0")),
     }
 
 
@@ -2559,15 +2571,49 @@ def _prepare_distributed_store_tensor_tree(
                 local_packet = _tensor_to_cuda_bytes(None, device)
             local_packets.append(local_packet)
         tensor_view_ms_local = (time.perf_counter() - tensor_view_start) * 1000.0
+        # cuda_payload() above may leave fragmented cached blocks after all
+        # strongly referenced payload slots have been materialized. Release
+        # only those unreferenced blocks immediately before EC allocates its
+        # group buffer.
+        if os.environ.get("RACER_AGGRESSIVE_CUDA_CLEANUP", "0") == "1":
+            launch_stream.synchronize()
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
+                if runtime.rank == 0:
+                    free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+                    print(
+                        "RACER pre-EC CUDA cleanup: "
+                        f"allocated={torch.cuda.memory_allocated(device)} "
+                        f"reserved={torch.cuda.memory_reserved(device)} "
+                        f"free={free_bytes} total={total_bytes}",
+                        flush=True,
+                    )
         racer_prepare_start = time.perf_counter()
+        distributed_config = _distributed_config(args)
         distributed_store_handle = prepare_distributed_store_many(
-            config=_distributed_config(args),
+            config=distributed_config,
             tags=chunk_tags,
             local_packets=local_packets,
             process_group=runtime.process_group,
             chunk_storage=chunk_storage,
             packet_sizes_by_tag=packet_sizes_by_tag,
         )
+        if int(distributed_config.max_inflight_ec_groups) > 0:
+            local_packets.clear()
+            chunks_release = payload_chunks.release_cuda_load_slots()
+            pool_release = _payload_buffer_pool().release_cuda_load_slots(device=device)
+            payload_chunks.profile.update(
+                {
+                    "payload_cuda_slot_released_count": max(
+                        float(chunks_release["released_cuda_load_slot_count"]),
+                        float(pool_release["released_cuda_load_slot_count"]),
+                    ),
+                    "payload_cuda_slot_released_nbytes": max(
+                        float(chunks_release["released_cuda_load_slot_nbytes"]),
+                        float(pool_release["released_cuda_load_slot_nbytes"]),
+                    ),
+                }
+            )
     racer_prepare_ms_local = (time.perf_counter() - racer_prepare_start) * 1000.0
     return _PreparedDistributedSave(
         args=args,
@@ -2718,6 +2764,12 @@ def _finalize_executed_distributed_store(executed: _ExecutedDistributedSave) -> 
         "payload_pool_reused_buffers": float(payload_profile.get("payload_pool_reused_buffers", 0.0)),
         "payload_pool_buffer_count": float(payload_profile.get("payload_pool_buffer_count", 0.0)),
         "payload_pool_reserved_nbytes": float(payload_profile.get("payload_pool_reserved_nbytes", 0.0)),
+        "payload_cuda_slot_released_count": float(
+            payload_profile.get("payload_cuda_slot_released_count", 0.0)
+        ),
+        "payload_cuda_slot_released_nbytes": float(
+            payload_profile.get("payload_cuda_slot_released_nbytes", 0.0)
+        ),
     }
     max_values_local.update(
         {f"racer_profile:{key}": racer_profile_local.get(key, 0.0) for key in _STORE_PROFILE_KEYS}
@@ -2846,6 +2898,12 @@ def _finalize_executed_distributed_store(executed: _ExecutedDistributedSave) -> 
         "racer_shared_commit_marker_cache_ms_max": max_values["shared_commit_marker_cache_ms"],
         "racer_checkpoint_metadata_publish_ms_max": max_values["checkpoint_metadata_publish_ms"],
         "payload_bytes_total": int(payload_bytes_total),
+        "payload_cuda_slot_released_count_max": int(
+            max_values["payload_cuda_slot_released_count"]
+        ),
+        "payload_cuda_slot_released_nbytes_max": int(
+            max_values["payload_cuda_slot_released_nbytes"]
+        ),
         "racer_encoded_storage_bytes_total": int(encoded_storage_bytes_total),
         "racer_storage_amplification": (
             float(encoded_storage_bytes_total) / float(payload_bytes_total)
@@ -3089,6 +3147,29 @@ def _distributed_load_tensor_tree(
     decode_start = time.perf_counter()
     state_dict = _decode_tensor_tree(tree["skeleton"], tensor_by_id)
     tree_decode_ms_local = (time.perf_counter() - decode_start) * 1000.0
+    # The decoded leaves own independent CUDA storage. Drop the fetch-slot
+    # cache after scatter/decode so it does not overlap optimizer restore and
+    # the first resumed training step. The loop-local payload otherwise keeps
+    # the final slot alive even after the pool releases its references.
+    if "payload" in locals():
+        del payload
+    load_slot_allocated_before = int(torch.cuda.memory_allocated(device))
+    load_slot_reserved_before = int(torch.cuda.memory_reserved(device))
+    load_slot_release = _payload_buffer_pool().release_cuda_load_slots(device=device)
+    if os.environ.get("RACER_AGGRESSIVE_CUDA_CLEANUP", "0") == "1":
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()
+    load_slot_allocated_after = int(torch.cuda.memory_allocated(device))
+    load_slot_reserved_after = int(torch.cuda.memory_reserved(device))
+    if _rank() == 0:
+        print(
+            "RACER load fetch-slot release: "
+            f"count={int(load_slot_release.get('released_cuda_load_slot_count', 0.0))}, "
+            f"bytes={int(load_slot_release.get('released_cuda_load_slot_nbytes', 0.0))}, "
+            f"allocated={load_slot_allocated_before}->{load_slot_allocated_after}, "
+            f"reserved={load_slot_reserved_before}->{load_slot_reserved_after}",
+            flush=True,
+        )
     load_rebuild_ms = (time.perf_counter() - load_start) * 1000.0
     load_rebuild_ms_max = _max_float_across_ranks(load_rebuild_ms, device)
     load_fetch_ms_max = _max_float_across_ranks(load_fetch_ms_local, device)
@@ -3111,6 +3192,16 @@ def _distributed_load_tensor_tree(
         "tensor_scatter_sync_ms": tensor_scatter_sync_ms_max,
         "tree_decode_ms": tree_decode_ms_max,
         "tensor_rebuild_ms": tensor_materialize_ms_max + tree_decode_ms_max,
+        "payload_cuda_load_slots_released_count_max": int(
+            _max_float_across_ranks(
+                load_slot_release.get("released_cuda_load_slot_count", 0.0), device
+            )
+        ),
+        "payload_cuda_load_slots_released_nbytes_max": int(
+            _max_float_across_ranks(
+                load_slot_release.get("released_cuda_load_slot_nbytes", 0.0), device
+            )
+        ),
         "payload_checksum_verify_ms_max": _max_float_across_ranks(payload_checksum_ms_local, device),
         "payload_checksum_chunks_local": int(payload_checksum_chunks_local),
         "total_ms_local": load_rebuild_ms_max,

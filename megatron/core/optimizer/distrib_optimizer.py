@@ -625,6 +625,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
         return getattr(self, 'grad_stats_parallel_group', None)
 
+    def _can_use_base_optimizer_state_dict_for_metadata(self):
+        """Whether the inner optimizer state dict can bypass precision expansion."""
+        return bool(
+            self.config.use_precision_aware_optimizer
+            and not isinstance(self.optimizer, HybridDeviceOptimizer)
+            and hasattr(self.optimizer, "get_unscaled_state")
+            and hasattr(self.optimizer, "set_scaled_state")
+        )
+
+    def _optimizer_state_dict_for_metadata(self):
+        """Return optimizer metadata without TE materializing unscaled tensor state."""
+        if self._can_use_base_optimizer_state_dict_for_metadata():
+            return torch.optim.Optimizer.state_dict(self.optimizer)
+        return self.optimizer.state_dict()
+
     def state_dict(self):
         """
         The state dict contains all non-DP-rank-dependent (i.e., non-parameter-
@@ -633,7 +648,14 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
         checkpoint file by calling 'save_parameter_state()'.
         """
-        inner_state_dict = self.optimizer.state_dict()
+        # The distributed checkpoint stores parameter-dependent optimizer state
+        # separately. Here we only need param-group metadata. TE FusedAdam's
+        # precision-aware state_dict() materializes FP32 copies of every compact
+        # BF16/FP8 state tensor, only for us to discard them below. For large
+        # models that unnecessary conversion can consume nearly another full
+        # optimizer and OOM before checkpointing starts. The torch base method
+        # preserves the same parameter-id/group layout without TE's conversion.
+        inner_state_dict = self._optimizer_state_dict_for_metadata()
         state_dict = {}
 
         # Extract 'step', for non-Apex/TE support.
@@ -725,7 +747,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             self.optimizer.load_state_dict(state_dict)
             return
 
-        if len(self.optimizer.state) == 0:
+        native_adopt_pending = getattr(self, "_racer_native_adopt_pending", None) is not None
+        if len(self.optimizer.state) == 0 and not native_adopt_pending:
             if isinstance(self.optimizer, HybridDeviceOptimizer):
                 self.optimizer.dummy_step()
 
@@ -755,7 +778,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for param_group in state_dict["optimizer"]["param_groups"]:
             needed_groups = make_needed_groups(param_group)
             param_groups_map[needed_groups] = param_group
-        inner_state_dict = self.optimizer.state_dict()
+        if self.config.use_precision_aware_optimizer and USING_TE_OPTIMIZER:
+            inner_state_dict = torch.optim.Optimizer.state_dict(self.optimizer)
+        else:
+            inner_state_dict = self.optimizer.state_dict()
         state_dict_param_groups = []
         for inner_param_group in inner_state_dict["param_groups"]:
             needed_groups = make_needed_groups(inner_param_group)
@@ -764,7 +790,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             )
 
         # Allocate or retrieve optimizer state (i.e., tensors).
-        if len(self.optimizer.state) == 0:
+        if native_adopt_pending:
+            state_dict_state = {}
+        elif len(self.optimizer.state) == 0:
             # Allocate empty optimizer state if not previously initialized.
             # - If len(self.optimizer.state) == 0, this means that the optimizer
             #   state has not been previously initialized. Once it has been
@@ -880,6 +908,121 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             else:
                 raise NotImplementedError(f'Unknown sharding_type: {sharding_type}')
 
+    def get_parameter_state_dp_reshardable_native_metadata(self):
+        """Describe a safe native precision-aware optimizer checkpoint layout.
+
+        The native layout is intentionally narrow. BF16 moments do not have
+        separate scale tensors, and an INT16 master parameter is the exact
+        remainder representation used together with the BF16 model parameter.
+        FP16 and FP8 moments require additional scale/quantizer metadata and
+        must continue through the unscaled legacy representation.
+        """
+        if not self._can_use_base_optimizer_state_dict_for_metadata():
+            return None
+        if not self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            return None
+        if not self.config.bf16 or not self.config.store_param_remainders:
+            return None
+        if self.config.main_params_dtype != torch.float32:
+            return None
+        if self.config.exp_avg_dtype != torch.bfloat16:
+            return None
+        if self.config.exp_avg_sq_dtype != torch.bfloat16:
+            return None
+        if not bool(getattr(self.optimizer, "store_param_remainders", False)):
+            return None
+
+        dtype_map = getattr(self.optimizer, "name_to_dtype_map", None)
+        if not isinstance(dtype_map, dict):
+            return None
+        if dtype_map.get("master_param") != torch.float32:
+            return None
+        if dtype_map.get("exp_avg") != torch.bfloat16:
+            return None
+        if dtype_map.get("exp_avg_sq") != torch.bfloat16:
+            return None
+
+        optimizer_type = type(self.optimizer)
+        return {
+            "schema": "te_precision_aware_bf16_moments_int16_remainder",
+            "optimizer_impl": f"{optimizer_type.__module__}.{optimizer_type.__qualname__}",
+            "params_dtype": str(self.config.params_dtype),
+            "main_params_dtype": str(self.config.main_params_dtype),
+            "exp_avg_dtype": str(self.config.exp_avg_dtype),
+            "exp_avg_sq_dtype": str(self.config.exp_avg_sq_dtype),
+            "store_param_remainders": True,
+            "fp8_recipe": self.config.fp8_recipe,
+            "raw_state_dtypes": {
+                "param": str(torch.int16),
+                "exp_avg": str(torch.bfloat16),
+                "exp_avg_sq": str(torch.bfloat16),
+            },
+        }
+
+    def prepare_parameter_state_dp_reshardable_native_load(self, metadata):
+        """Arm a one-shot native zero-copy load after validating its metadata."""
+        import time
+
+        started = time.perf_counter()
+        if getattr(self, "_racer_native_adopt_pending", None) is not None:
+            raise RuntimeError("RACER native optimizer load is already pending")
+        current_metadata = self.get_parameter_state_dp_reshardable_native_metadata()
+        if current_metadata is None:
+            raise RuntimeError("current optimizer does not support RACER native zero-copy loading")
+        if metadata != current_metadata:
+            raise ValueError(
+                "RACER native optimizer metadata mismatch: "
+                f"checkpoint={metadata!r}, current={current_metadata!r}"
+            )
+        if any(bool(value) for value in self.optimizer.state.values()):
+            raise RuntimeError(
+                "RACER native zero-copy load requires empty optimizer tensor state"
+            )
+        if not hasattr(self.optimizer, "_scales"):
+            raise RuntimeError("RACER native zero-copy load requires TE optimizer scales")
+        self._racer_native_adopt_pending = {
+            "metadata_ms": (time.perf_counter() - started) * 1000.0,
+        }
+
+    def clear_parameter_state_dp_reshardable_native_load(self):
+        """Disarm a pending native load without changing optimizer state."""
+        self._racer_native_adopt_pending = None
+
+    def _get_main_param_and_optimizer_states_native(self, model_param):
+        """Return raw compact TE state tensors without unscaling or copying."""
+        if self.get_parameter_state_dp_reshardable_native_metadata() is None:
+            raise RuntimeError(
+                "native dp_reshardable optimizer capture requires TE precision-aware "
+                "BF16 moments and INT16 master-parameter remainders"
+            )
+
+        group_index, group_order = self.model_param_group_index_map[model_param]
+        sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
+        optimizer_state = self.optimizer.state[sharded_model_param]
+        expected_dtypes = {
+            "master_param": torch.int16,
+            "exp_avg": torch.bfloat16,
+            "exp_avg_sq": torch.bfloat16,
+        }
+        tensor_keys = {key for key, value in optimizer_state.items() if isinstance(value, torch.Tensor)}
+        if tensor_keys != set(expected_dtypes):
+            raise RuntimeError(
+                "native dp_reshardable optimizer state keys do not match the supported schema: "
+                f"expected={sorted(expected_dtypes)}, actual={sorted(tensor_keys)}"
+            )
+
+        tensors = {}
+        for state_name, expected_dtype in expected_dtypes.items():
+            value = optimizer_state[state_name]
+            if value.dtype != expected_dtype:
+                raise RuntimeError(
+                    "native dp_reshardable optimizer state dtype mismatch: "
+                    f"state={state_name}, expected={expected_dtype}, actual={value.dtype}"
+                )
+            checkpoint_name = "param" if state_name == "master_param" else state_name
+            tensors[checkpoint_name] = value
+        return tensors
+
     def _get_main_param_and_optimizer_states(self, model_param):
         """Return a dict containing the main param and optimizer states corresponding to the input
         model_param.
@@ -951,14 +1094,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     continue
                 dst_tensors[key].copy_(tensors[key])
 
-    def get_parameter_state_dp_reshardable(self):
-        """Get internal representation of parameter state without any copies and modifications.
-
-        This is referred to as "fully sharded bucket space" because the optimizer state is
-        fully sharded (e.g. no gather involved) and bucket-centric (the state
-        follows the internal structure of the Distributed Optimizer buckets)
-        as opposed to model-centric (typical structure of PyT optimizers)
-        """
+    def _get_parameter_state_dp_reshardable(self, tensor_getter):
+        """Build bucket state using the provided per-parameter tensor getter."""
         state = {
             "per_bucket_numel": self.per_bucket_numel,
             "per_bucket_numel_unpadded": self.per_bucket_numel_unpadded,
@@ -973,7 +1110,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 for bucket_idx, gbuf_range_map in enumerate(gbuf_range_map_for_all_buckets):
                     bucket_state = []
                     for model_param, param_range_map in gbuf_range_map["param_map"].items():
-                        tensors = self._get_main_param_and_optimizer_states(model_param)
+                        tensors = tensor_getter(model_param)
                         tensors.update(
                             {
                                 "gbuf_local_start": param_range_map["gbuf_local"].start,
@@ -985,6 +1122,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 dtype_state[dtype] = buckets_state
             state[gbuf_idx] = dtype_state
         return state
+
+    def get_parameter_state_dp_reshardable(self):
+        """Get internal representation of parameter state without DP gathers.
+
+        This is referred to as "fully sharded bucket space" because the optimizer state is
+        fully sharded (e.g. no gather involved) and bucket-centric (the state
+        follows the internal structure of the Distributed Optimizer buckets)
+        as opposed to model-centric (typical structure of PyT optimizers)
+        """
+        return self._get_parameter_state_dp_reshardable(
+            self._get_main_param_and_optimizer_states
+        )
+
+    def get_parameter_state_dp_reshardable_native(self):
+        """Get raw compact precision-aware state without allocating FP32 snapshots."""
+        if self.get_parameter_state_dp_reshardable_native_metadata() is None:
+            raise RuntimeError("native dp_reshardable optimizer capture is not supported")
+        return self._get_parameter_state_dp_reshardable(
+            self._get_main_param_and_optimizer_states_native
+        )
 
     def get_parameter_state_dp_zero(
         self,
@@ -1781,11 +1938,50 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         param_idx += 1
         return state
 
-    def load_parameter_state_from_dp_reshardable(self, state_dict):
-        """Loads the parameter state from an internal representation.
+    @torch.no_grad()
+    def _set_main_param_and_optimizer_states_native(self, model_param, tensors):
+        """Restore raw compact TE state into the optimizer's existing tensors."""
+        if self.get_parameter_state_dp_reshardable_native_metadata() is None:
+            raise RuntimeError(
+                "current optimizer configuration does not support native dp_reshardable loading"
+            )
 
-        Inverse of the `get_parameter_state_dp_reshardable` method.
-        """
+        group_index, group_order = self.model_param_group_index_map[model_param]
+        sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
+        optimizer_state = self.optimizer.state[sharded_model_param]
+        expected_dtypes = {
+            "param": torch.int16,
+            "exp_avg": torch.bfloat16,
+            "exp_avg_sq": torch.bfloat16,
+        }
+        for checkpoint_name, expected_dtype in expected_dtypes.items():
+            source = tensors.get(checkpoint_name)
+            if not isinstance(source, torch.Tensor):
+                raise RuntimeError(
+                    f"native dp_reshardable checkpoint is missing tensor {checkpoint_name!r}"
+                )
+            if source.dtype != expected_dtype:
+                raise RuntimeError(
+                    "native dp_reshardable checkpoint dtype mismatch: "
+                    f"state={checkpoint_name}, expected={expected_dtype}, actual={source.dtype}"
+                )
+            state_name = "master_param" if checkpoint_name == "param" else checkpoint_name
+            destination = optimizer_state.get(state_name)
+            if not isinstance(destination, torch.Tensor):
+                raise RuntimeError(
+                    f"current optimizer is missing native state tensor {state_name!r}"
+                )
+            if destination.dtype != expected_dtype or destination.shape != source.shape:
+                raise RuntimeError(
+                    "current optimizer native state does not match checkpoint: "
+                    f"state={state_name}, checkpoint_dtype={source.dtype}, "
+                    f"current_dtype={destination.dtype}, checkpoint_shape={tuple(source.shape)}, "
+                    f"current_shape={tuple(destination.shape)}"
+                )
+            destination.copy_(source)
+
+    def _load_parameter_state_from_dp_reshardable(self, state_dict, tensor_setter):
+        """Load bucket state using the provided per-parameter tensor setter."""
         if state_dict is not None and "per_bucket_numel_unpadded" in state_dict:
             per_bucket_numel_unpadded_in_checkpoint = state_dict["per_bucket_numel_unpadded"]
             assert self.per_bucket_numel_unpadded == per_bucket_numel_unpadded_in_checkpoint, (
@@ -1812,8 +2008,171 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     for src_tensors, (model_param, param_range_map) in zip(
                         bucket_state, gbuf_range_map["param_map"].items()
                     ):
-                        # Main param & optimizer states.
-                        self._set_main_param_and_optimizer_states(model_param, src_tensors)
+                        tensor_setter(model_param, src_tensors)
+
+    def load_parameter_state_from_dp_reshardable(self, state_dict):
+        """Loads the legacy unscaled parameter state representation.
+
+        Inverse of the `get_parameter_state_dp_reshardable` method.
+        """
+        self._load_parameter_state_from_dp_reshardable(
+            state_dict, self._set_main_param_and_optimizer_states
+        )
+
+    @torch.no_grad()
+    def load_parameter_state_from_dp_reshardable_native(self, state_dict):
+        """Validate all native shards, then adopt their CUDA views zero-copy."""
+        import time
+
+        pending = getattr(self, "_racer_native_adopt_pending", None)
+        if pending is None:
+            raise RuntimeError(
+                "RACER native optimizer load was not preflighted before optimizer.load_state_dict"
+            )
+        started = time.perf_counter()
+        validated = []
+        expected_local_ranges = {}
+        for gbuf_range_maps in self.gbuf_ranges:
+            for gbuf_range_map_for_all_buckets in gbuf_range_maps.values():
+                for gbuf_range_map in gbuf_range_map_for_all_buckets:
+                    for model_param, param_range_map in gbuf_range_map["param_map"].items():
+                        local_range = param_range_map["gbuf_local"]
+                        expected_local_ranges[model_param] = (local_range.start, local_range.end)
+
+        def validate_and_collect(model_param, tensors):
+            expected_keys = {
+                "param",
+                "exp_avg",
+                "exp_avg_sq",
+                "padding",
+                "gbuf_local_start",
+                "gbuf_local_end",
+            }
+            if not isinstance(tensors, dict) or set(tensors) != expected_keys:
+                raise ValueError(
+                    "native optimizer leaf keys mismatch: "
+                    f"expected={sorted(expected_keys)}, actual={sorted(tensors)}"
+                )
+            if tensors["padding"] is not False:
+                raise ValueError("native optimizer parameter leaf cannot be padding")
+
+            local_start = tensors["gbuf_local_start"]
+            local_end = tensors["gbuf_local_end"]
+            if (
+                isinstance(local_start, bool)
+                or not isinstance(local_start, int)
+                or isinstance(local_end, bool)
+                or not isinstance(local_end, int)
+            ):
+                raise TypeError("native optimizer gbuf local bounds must be integers")
+            if not 0 <= local_start <= local_end:
+                raise ValueError(
+                    "native optimizer gbuf local bounds are invalid: "
+                    f"start={local_start}, end={local_end}"
+                )
+            expected_local_range = expected_local_ranges.get(model_param)
+            if expected_local_range is None:
+                raise ValueError("native optimizer parameter has no current gbuf local range")
+            if (local_start, local_end) != expected_local_range:
+                raise ValueError(
+                    "native optimizer gbuf local range mismatch: "
+                    f"checkpoint={(local_start, local_end)}, expected={expected_local_range}"
+                )
+
+            group_index, group_order = self.model_param_group_index_map[model_param]
+            sharded_model_param = self.optimizer.param_groups[group_index]["params"][group_order]
+            expected_dtypes = {
+                "param": torch.int16,
+                "exp_avg": torch.bfloat16,
+                "exp_avg_sq": torch.bfloat16,
+            }
+            for state_name, expected_dtype in expected_dtypes.items():
+                source = tensors[state_name]
+                if not isinstance(source, torch.Tensor):
+                    raise TypeError(f"native optimizer state {state_name!r} is not a tensor")
+                if source.dtype != expected_dtype:
+                    raise ValueError(
+                        f"native optimizer {state_name} dtype mismatch: "
+                        f"checkpoint={source.dtype}, expected={expected_dtype}"
+                    )
+                if source.shape != sharded_model_param.shape:
+                    raise ValueError(
+                        f"native optimizer {state_name} shape mismatch: "
+                        f"checkpoint={tuple(source.shape)}, "
+                        f"expected={tuple(sharded_model_param.shape)}"
+                    )
+                if source.numel() != local_end - local_start:
+                    raise ValueError(
+                        f"native optimizer {state_name} numel/range mismatch: "
+                        f"numel={source.numel()}, range={(local_start, local_end)}"
+                    )
+                if source.device != sharded_model_param.device or source.device.type != "cuda":
+                    raise ValueError(
+                        f"native optimizer {state_name} device mismatch: "
+                        f"checkpoint={source.device}, expected={sharded_model_param.device}"
+                    )
+                if not source.is_contiguous():
+                    raise ValueError(f"native optimizer {state_name} must be contiguous")
+            if self.optimizer.state.get(sharded_model_param):
+                raise RuntimeError("native optimizer target tensor state is not empty")
+            validated.append((sharded_model_param, tensors))
+
+        try:
+            # This traversal validates bucket counts/order and unpadded lengths;
+            # the callback validates every tensor before any optimizer state mutates.
+            self._load_parameter_state_from_dp_reshardable(state_dict, validate_and_collect)
+
+            expected_params = [
+                param for group in self.optimizer.param_groups for param in group["params"]
+            ]
+            if len(validated) != len(expected_params):
+                raise ValueError(
+                    "native optimizer parameter count mismatch: "
+                    f"checkpoint={len(validated)}, expected={len(expected_params)}"
+                )
+            validated_ids = [id(param) for param, _ in validated]
+            if len(set(validated_ids)) != len(validated_ids):
+                raise ValueError("native optimizer payload contains duplicate parameters")
+            if set(validated_ids) != {id(param) for param in expected_params}:
+                raise ValueError("native optimizer payload parameters do not match optimizer groups")
+
+            scales = [
+                {
+                    "exp_avg": torch.ones(
+                        1, dtype=torch.float32, device=tensors["exp_avg"].device
+                    ),
+                    "exp_avg_sq": torch.ones(
+                        1, dtype=torch.float32, device=tensors["exp_avg_sq"].device
+                    ),
+                }
+                for _, tensors in validated
+            ]
+
+            adopted_tensors = 0
+            adopted_bytes = 0
+            for (sharded_model_param, tensors), param_scales in zip(validated, scales):
+                self.optimizer.state[sharded_model_param] = {
+                    "master_param": tensors["param"],
+                    "exp_avg": tensors["exp_avg"],
+                    "exp_avg_sq": tensors["exp_avg_sq"],
+                }
+                self.optimizer._scales[sharded_model_param] = param_scales
+                for state_name in ("param", "exp_avg", "exp_avg_sq"):
+                    adopted_tensors += 1
+                    adopted_bytes += (
+                        tensors[state_name].numel() * tensors[state_name].element_size()
+                    )
+
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "RACER native optimizer zero-copy adopt: "
+                f"tensors={adopted_tensors}, bytes={adopted_bytes}, "
+                f"adopt_ms={elapsed_ms:.3f}, metadata_ms={pending['metadata_ms']:.3f}",
+            )
+        finally:
+            self.clear_parameter_state_dp_reshardable_native_load()
 
     @torch.no_grad()
     def load_parameter_state_from_fs_model_space(self, state_dict):

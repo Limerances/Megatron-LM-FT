@@ -217,6 +217,20 @@ class PinnedPayloadBufferPool:
         )
         return {index: tensor for index, tensor in enumerate(slots[:slot_count])}
 
+    def release_cuda_load_slots(self, *, device: torch.device) -> dict[str, float]:
+        """Drop pool-owned CUDA load-slot references for one device."""
+
+        device_key = str(torch.device(device))
+        slots = self.cuda_load_slots.pop(device_key, [])
+        self.cuda_load_slot_sizes.pop(device_key, None)
+        released_nbytes = sum(
+            int(slot.numel()) * int(slot.element_size()) for slot in slots
+        )
+        return {
+            "released_cuda_load_slot_count": float(len(slots)),
+            "released_cuda_load_slot_nbytes": float(released_nbytes),
+        }
+
     def prewarm(
         self,
         *,
@@ -291,6 +305,19 @@ class PinnedPayloadChunks:
         dst = load_slot.narrow(0, 0, nbytes)
         dst.copy_(self.buffers[index].narrow(0, 0, nbytes), non_blocking=True)
         return dst
+
+    def release_cuda_load_slots(self) -> dict[str, float]:
+        """Drop chunk-container CUDA slot references while retaining pinned payloads."""
+
+        slots = list(self._load_slots.values())
+        released_nbytes = sum(
+            int(slot.numel()) * int(slot.element_size()) for slot in slots
+        )
+        self._load_slots.clear()
+        return {
+            "released_cuda_load_slot_count": float(len(slots)),
+            "released_cuda_load_slot_nbytes": float(released_nbytes),
+        }
 
 
 def pack_tensor_chunks_to_pinned(

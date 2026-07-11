@@ -1955,6 +1955,28 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if racer_checkpointing.racer_checkpoint_enabled(args):
         racer_distributed_optimizer_state = racer_checkpointing.pop_distributed_optimizer_state(state_dict)
 
+    def is_racer_native_optimizer_state(envelope):
+        if isinstance(envelope, (list, tuple)):
+            return bool(envelope) and all(is_racer_native_optimizer_state(item) for item in envelope)
+        if not isinstance(envelope, dict):
+            return False
+        return any(
+            isinstance(value, str) and value == 'dp_reshardable_precision_native'
+            for value in envelope.values()
+        )
+
+    release_racer_native_model_source = (
+        not skip_load_to_model_and_opt
+        and is_racer_native_optimizer_state(racer_distributed_optimizer_state)
+    )
+    racer_native_optimizer_adopted = False
+    racer_model_source_memory_before = None
+    if release_racer_native_model_source and torch.cuda.is_available():
+        racer_model_source_memory_before = (
+            torch.cuda.memory_allocated(),
+            torch.cuda.memory_reserved(),
+        )
+
     # Check arguments.
     if 'args' in state_dict and not args.finetune:
         checkpoint_args = state_dict['args']
@@ -1982,13 +2004,36 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:
             load_model_state_dict(ddp_model[0], state_dict['model'], strict)
+            if release_racer_native_model_source:
+                state_dict.pop('model', None)
         else:
             for i in range(len(ddp_model)):
                 # If there is no corresponding model in the state_dict, it will be ignored.
                 # It means that this is an empty stage.
-                if 'model%d' % i not in state_dict:
+                model_state_key = 'model%d' % i
+                if model_state_key not in state_dict:
                     continue
-                load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
+                load_model_state_dict(ddp_model[i], state_dict[model_state_key], strict)
+                if release_racer_native_model_source:
+                    state_dict.pop(model_state_key, None)
+
+    if release_racer_native_model_source and torch.cuda.is_available():
+        aggressive_cuda_cleanup = os.getenv(
+            'RACER_AGGRESSIVE_CUDA_CLEANUP', '0'
+        ).strip().lower() not in ('', '0', 'false', 'no', 'off')
+        if aggressive_cuda_cleanup:
+            torch.cuda.empty_cache()
+        allocated_after = torch.cuda.memory_allocated()
+        reserved_after = torch.cuda.memory_reserved()
+        allocated_before, reserved_before = racer_model_source_memory_before
+        print_rank_0(
+            'RACER native model source release: '
+            f'allocated {allocated_before / (1024 ** 3):.2f} -> '
+            f'{allocated_after / (1024 ** 3):.2f} GiB, reserved '
+            f'{reserved_before / (1024 ** 3):.2f} -> '
+            f'{reserved_after / (1024 ** 3):.2f} GiB, '
+            f'empty_cache={aggressive_cuda_cleanup}'
+        )
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f' checkpoint version {checkpoint_version}')
@@ -1996,6 +2041,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
     # Optimizer.
     if not release and not args.finetune and not args.no_load_optim:
+        racer_native_preflight_active = False
+        racer_native_optimizer_state_helpers = None
         try:
             # Load state dict.
             if (not racer_checkpointing.racer_checkpoint_enabled(args)) and getattr(args, "optimizer", "adam").startswith("dist_") and args.ckpt_format == 'torch':
@@ -2004,18 +2051,48 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 optim_checkpoint_name = os.path.join(os.path.dirname(checkpoint_name), f"layer_wise_optimizer_{dp_rank}.pt")
                 optimizer.load_state_dict_from_file(optim_checkpoint_name)
             elif not skip_load_to_model_and_opt and optimizer is not None and not optimizer.is_stub_optimizer:
-                optimizer.load_state_dict(state_dict['optimizer'])
+                if release_racer_native_model_source:
+                    from megatron.training.racer import optimizer_state as racer_native_optimizer_state_helpers
+
+                    native_preflight_profile = (
+                        racer_native_optimizer_state_helpers.prepare_native_optimizer_state_load(
+                            optimizer, racer_distributed_optimizer_state
+                        )
+                    )
+                    racer_native_preflight_active = True
+                    print_rank_0(
+                        "RACER native optimizer preflight: "
+                        f"optimizers={native_preflight_profile['optimizers']}, "
+                        f"metadata_ms={native_preflight_profile['metadata_ms']:.3f}"
+                    )
+                try:
+                    optimizer.load_state_dict(state_dict['optimizer'])
+                except Exception:
+                    if racer_native_preflight_active:
+                        racer_native_optimizer_state_helpers.clear_native_optimizer_state_preflight(
+                            optimizer
+                        )
+                        racer_native_preflight_active = False
+                    raise
 
             # Load distributed optimizer's custom parameter state.
             # For distributed checkpoint it's already loaded in load_state_dict above
             is_torch_dist = ckpt_format == "torch_dist"
             if args.use_distributed_optimizer and not is_torch_dist and ckpt_format not in ["torch_dcp", "fsdp_dtensor"]:
                 if racer_distributed_optimizer_state is not None:
-                    racer_checkpointing.load_distributed_optimizer_state(
-                        optimizer,
-                        racer_distributed_optimizer_state,
-                        update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format,
-                    )
+                    try:
+                        racer_checkpointing.load_distributed_optimizer_state(
+                            optimizer,
+                            racer_distributed_optimizer_state,
+                            update_legacy_format=args.ckpt_convert_update_legacy_dist_opt_format,
+                        )
+                        racer_native_optimizer_adopted = release_racer_native_model_source
+                    finally:
+                        if racer_native_preflight_active:
+                            racer_native_optimizer_state_helpers.clear_native_optimizer_state_preflight(
+                                optimizer
+                            )
+                            racer_native_preflight_active = False
                 elif racer_checkpointing.racer_checkpoint_enabled(args):
                     raise RuntimeError(
                         "RACER memory checkpoint did not contain distributed optimizer parameter state. "
@@ -2115,6 +2192,50 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                          'attempting to load the rng state, '
                          'exiting ...'.format(checkpoint_name))
             sys.exit()
+
+    # All checkpoint consumers have completed.  Adopted optimizer tensor views
+    # keep their backing CUDA byte storage alive independently of these trees.
+    if racer_native_optimizer_adopted:
+        import gc
+
+        allocated_before = torch.cuda.memory_allocated()
+        reserved_before = torch.cuda.memory_reserved()
+
+        if isinstance(racer_distributed_optimizer_state, (dict, list)):
+            racer_distributed_optimizer_state.clear()
+        state_dict.clear()
+        del racer_distributed_optimizer_state
+        del state_dict
+        try:
+            del rng_state
+        except UnboundLocalError:
+            pass
+        try:
+            del rng_tracker_states
+        except UnboundLocalError:
+            pass
+        try:
+            del dtensor_state_dict
+        except UnboundLocalError:
+            pass
+
+        gc.collect()
+        aggressive_cuda_cleanup = os.getenv(
+            'RACER_AGGRESSIVE_CUDA_CLEANUP', '0'
+        ).strip().lower() not in ('', '0', 'false', 'no', 'off')
+        if aggressive_cuda_cleanup:
+            torch.cuda.empty_cache()
+
+        allocated_after = torch.cuda.memory_allocated()
+        reserved_after = torch.cuda.memory_reserved()
+        print_rank_0(
+            'RACER native checkpoint post-load release: '
+            f'allocated {allocated_before / (1024 ** 3):.2f} -> '
+            f'{allocated_after / (1024 ** 3):.2f} GiB, reserved '
+            f'{reserved_before / (1024 ** 3):.2f} -> '
+            f'{reserved_after / (1024 ** 3):.2f} GiB, '
+            f'empty_cache={aggressive_cuda_cleanup}'
+        )
 
     # Some utilities want to load a checkpoint without distributed being initialized
     if torch.distributed.is_initialized():
