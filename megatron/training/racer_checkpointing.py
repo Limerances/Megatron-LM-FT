@@ -636,6 +636,8 @@ def load_memory_checkpoint(
         return None
 
     load_tag = str(tag)
+    _SESSION.latest_tag = load_tag
+    _SESSION.tags_by_iteration[int(loaded_iteration)] = load_tag
     _ensure_tree_checkpoint(args, load_tag, rank=_replacement_source_rank_for_current_process(replacement_mapping))
     if load_tag in _SESSION.tree_checkpoints:
         state_dict, report = _distributed_load_tensor_tree(
@@ -2313,6 +2315,17 @@ def _prune_old_checkpoints(args: Any) -> None:
                         f"{chunk_tag!r}: {type(exc).__name__}: {exc}",
                         flush=True,
                     )
+            if os.environ.get("RACER_EGM_TRIM_FREE_SEGMENTS", "0").lower() in {
+                "1", "true", "yes", "on",
+            }:
+                trim_report = dict(csd_storage.trim())
+                print(
+                    f"RACER EGM post-prune trim: rank={_rank()}, "
+                    f"released_segments={int(trim_report.get('released_segments', 0))}, "
+                    f"released_bytes={int(trim_report.get('released_bytes', 0))}, "
+                    f"replenished_segments={int(trim_report.get('replenished_segments', 0))}",
+                    flush=True,
+                )
     else:
         ctx = _SESSION.local_racer_context
         if ctx is not None:
@@ -2479,6 +2492,40 @@ def _prepare_distributed_store_tensor_tree(
     state_for_save: dict[str, Any],
     device: torch.device,
 ) -> _PreparedDistributedSave:
+    if os.environ.get("RACER_PRUNE_BEFORE_SAVE", "0").lower() in {"1", "true", "yes", "on"}:
+        if not racer_distributed_store_enabled(args) or _racer_storage_backend(args) != "csd_egm":
+            raise RuntimeError("RACER_PRUNE_BEFORE_SAVE is restricted to distributed csd_egm")
+        previous_tag = _SESSION.latest_tag
+        if previous_tag is not None and str(previous_tag) != str(tag):
+            payload_pool = _payload_buffer_pool()
+            released_host_bytes = sum(
+                int(buffer.numel()) * int(buffer.element_size())
+                for buffer in payload_pool.buffers
+            )
+            payload_pool.buffers.clear()
+            payload_pool.chunk_size = 0
+            payload_pool.release_cuda_load_slots(device=device)
+            import gc
+            gc.collect()
+            host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
+            if callable(host_empty_cache):
+                host_empty_cache()
+            _print_rank0(
+                "RACER pre-save payload pool release: "
+                f"bytes={released_host_bytes}, upcoming={tag}"
+            )
+            _SESSION.tags_by_iteration[int(iteration)] = str(tag)
+            try:
+                _prune_old_checkpoints(args)
+            finally:
+                if _SESSION.tags_by_iteration.get(int(iteration)) == str(tag):
+                    _SESSION.tags_by_iteration.pop(int(iteration), None)
+            _SESSION.latest_tag = None
+            _barrier()
+            _print_rank0(
+                "RACER EGM pre-save rolling prune complete: "
+                f"removed={previous_tag}, upcoming={tag}"
+            )
     metadata_start = time.perf_counter()
     skeleton, metas, tensors = _extract_tensor_tree(state_for_save)
     metadata_ms = (time.perf_counter() - metadata_start) * 1000.0
@@ -2577,6 +2624,28 @@ def _prepare_distributed_store_tensor_tree(
         # group buffer.
         if os.environ.get("RACER_AGGRESSIVE_CUDA_CLEANUP", "0") == "1":
             launch_stream.synchronize()
+            if os.environ.get("RACER_RELEASE_PINNED_AFTER_MATERIALIZE", "0").lower() in {
+                "1", "true", "yes", "on",
+            }:
+                released_pinned_bytes = int(payload_chunks.total_reserved_nbytes)
+                payload_chunks.profile["payload_pinned_reserved_nbytes_before_release"] = float(
+                    released_pinned_bytes
+                )
+                payload_chunks.buffers.clear()
+                payload_pool = _payload_buffer_pool()
+                payload_pool.buffers.clear()
+                payload_pool.chunk_size = 0
+                import gc
+                gc.collect()
+                host_empty_cache = getattr(torch._C, "_host_emptyCache", None)
+                if callable(host_empty_cache):
+                    host_empty_cache()
+                if runtime.rank == 0:
+                    print(
+                        "RACER pre-store pinned payload release: "
+                        f"bytes={released_pinned_bytes}",
+                        flush=True,
+                    )
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
                 if runtime.rank == 0:
